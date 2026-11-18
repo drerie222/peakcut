@@ -4,6 +4,8 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
+from unittest.mock import patch
 
 os.environ["PEAKCUT_DATA"] = tempfile.mkdtemp()
 sys.path.insert(0, sys.argv[1])
@@ -19,6 +21,29 @@ def check(name, ok, extra=""):
     print(("PASS " if ok else "FAIL ") + name + (f"   {extra}" if extra else ""))
     if not ok:
         fails.append(name)
+
+
+# ---- a Linux group can have fewer CPUs than the machine reports
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    group = root / "peakcut"
+    group.mkdir()
+    membership = root / "membership"
+    membership.write_text("0::/peakcut\n")
+    (root / "cpu.max").write_text("max 100000\n")
+    (group / "cpu.max").write_text("max 100000\n")
+    with patch.multiple(load, _CGROUP_ROOT=root, _CGROUP_MEMBERSHIP=membership), patch.object(os, "cpu_count", return_value=3):
+        check("without a quota the monitor uses machine CPU time", load._cgroup_cpu_reader() is None)
+        (root / "cpu.max").write_text("200000 100000\n")
+        (root / "cpu.stat").write_text("usage_usec 4000000\n")
+        (group / "cpu.stat").write_text("usage_usec 1000000\n")
+        read = load._cgroup_cpu_reader()
+        with patch.object(time, "monotonic_ns", return_value=3_000_000_000):
+            check("the monitor reads the group with the inherited quota", read is not None and read() == (4_000_000, 6_000_000))
+        (group / "cpu.max").write_text("150000 100000\n")
+        read = load._cgroup_cpu_reader()
+        with patch.object(time, "monotonic_ns", return_value=3_000_000_000):
+            check("a tighter quota on PeakCut itself takes precedence", read is not None and read() == (1_000_000, 4_500_000))
 
 
 # ---- the monitor measures something real
@@ -78,3 +103,4 @@ if __name__ == "__main__":
     time.sleep(1.5)
     check("line is empty and nothing is held", q.running == 0 and not q.turn)
     print("\n%d failed" % len(fails) if fails else "\nALL PASSED")
+    sys.exit(1 if fails else 0)

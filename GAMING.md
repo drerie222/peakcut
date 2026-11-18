@@ -80,13 +80,13 @@ border that stays in the same place in every frame**. A wall in the game moves, 
 HUD bar changes, the edge of the webcam box does not move at all.
 
 - frames spread through the video are looked at small (320x180)
-- for every column and every row, how much the picture changes at that line is
-  counted, and the median over the frames is taken, so one busy moment cannot
-  invent a line
+- the brightness change across each pixel boundary must point in the same
+  direction in most sampled frames. Evenly flickering lines are ignored.
 - the lines that stand out are the borders. Any rectangle they and the frame's own
   edges can make is a candidate: a webcam may sit in a corner, along one edge, or
   even with a margin all round. Square and upright pictures count too, because a
-  vertical webcam is common.
+  vertical webcam is common. Each side must stand out along the proposed box
+  itself, so a line elsewhere in the game cannot supply its border.
 - **the picture inside has to be still.** This is what tells a webcam from the
   game's own panels, which have straight borders too and are drawn over the game
   with the game showing through them. A person sits in a room and shifts a little;

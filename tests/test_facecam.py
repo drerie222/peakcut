@@ -55,6 +55,13 @@ try:
                     "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", plain], check=True)
     check("a video with nothing still in it finds no webcam", (facecam.detect(plain) or {}).get("conf", "none"), "none")
 
+    # Low-contrast game regions can flicker along strong lines without a lasting webcam border.
+    flicker = os.path.join(work, "flicker.mp4")
+    stripes = "nullsrc=s=320x180:r=6,geq=lum='128+pow(-1,N)*3*(gt(X,79)+gt(Y,44))':cb=128:cr=128"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", stripes, "-frames:v", "24",
+                    "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv420p", flicker], check=True)
+    check("flickering lines do not make a webcam border", facecam.detect(flicker), None)
+
     # ---- a file that cannot be read must not stop a job
     check("a file that cannot be read gives nothing, not an error",
           facecam.detect(os.path.join(work, "nope.mp4")), None)
@@ -89,6 +96,8 @@ try:
           abs((box or {}).get("x", 0) - 920) <= 3, True)
     box = facecam.detect(sq, ask=say(False))                              # a model that only reads text
     check("a model that cannot look at pictures changes nothing", abs((box or {}).get("x", 0) - 920) <= 3, True)
+    check("a model hint still needs a lasting border",
+          facecam.detect(flicker, ask=say(True, (0.0, 0.0, 0.25, 0.25))), None)
 
     # ---- what the model's one line is turned into
     from unittest.mock import patch

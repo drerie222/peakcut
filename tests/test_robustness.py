@@ -32,6 +32,7 @@ with ctx.as_user(a.id):
 
 # ---------------------------------------------------------------- the machine monitor on a system it cannot fully measure
 def boom(): raise OSError("no /proc/stat here")
+load._cgroup_cpu_reader = lambda: None
 load._cpu_times = boom
 load._state.update(disk_free=99.0, at=0.0, ram_free=99.0)
 real_sleep = time.sleep
