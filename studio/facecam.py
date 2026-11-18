@@ -12,9 +12,8 @@ at all. A second thing tells the webcam apart from the game's own panels, which
 have straight borders too: the picture inside a webcam is almost still, while
 the game behind a panel keeps moving.
 
-Metric: for every column and every row, how much the picture changes at that
-line, counted over frames spread through the video. A border of the webcam box
-stands out from the rest.
+Across frames spread through the video, look for a lasting change in brightness
+across a line. The lines must also stand out along the sides of the proposed box.
 
 One frame can also be shown to the AI (`detect(path, ask=...)`), which is better
 than any measurement at telling a person from a game character. Its answer is
@@ -75,16 +74,19 @@ def _duration(path: str | Path) -> float:
         return 0.0
 
 
-def _profiles(frames: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(vertical lines, horizontal lines): how much changes at each column and each row.
-
-    The median over the frames is used, so one busy moment cannot invent a line."""
-    if len(frames) < 4:
-        return np.zeros(W), np.zeros(H)
+def _edges(frames: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The contrast that lasts across each pixel boundary in the sampled frames."""
     f = frames.astype(np.int16)
-    gx = np.median(np.abs(np.diff(f, axis=2)).sum(axis=1), axis=0)   # change across each column boundary
-    gy = np.median(np.abs(np.diff(f, axis=1)).sum(axis=2), axis=0)   # change across each row boundary
-    return gx, gy
+    lower, upper = (len(f) - 1) // 2, len(f) // 2
+
+    def persistent(axis):
+        contrast = np.diff(f, axis=axis)
+        contrast.partition((lower, upper), axis=0)
+        # Use the middle sample closer to zero. If they straddle zero, neither
+        # direction has a majority, even if one is brighter than the other.
+        return np.maximum(0, np.maximum(contrast[lower], -contrast[upper]))
+
+    return persistent(2), persistent(1)
 
 
 def _peaks(profile: np.ndarray, limit: int) -> list[tuple[int, float]]:
@@ -97,6 +99,23 @@ def _peaks(profile: np.ndarray, limit: int) -> list[tuple[int, float]]:
         if profile[i] >= profile[i - 1] and profile[i] > profile[i + 1] and profile[i] > EDGE * med:
             out.append((i, float(profile[i] / med)))
     return sorted(out, key=lambda p: -p[1])[:limit]
+
+
+def _has_borders(box, edges):
+    """Check the lines along the box itself, where edges elsewhere in the picture cannot help."""
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    vertical, horizontal = edges
+    cols = vertical[y0:y1, :].sum(axis=0)
+    rows = horizontal[:, x0:x1].sum(axis=1)
+    for profile, extent, sides in ((cols, W, (x0, x1)), (rows, H, (y0, y1))):
+        floor = EDGE * (float(np.median(profile)) or 1.0)
+        for side in sides:
+            if 0 < side < extent:
+                # A boundary snapped at full size can be one pixel away on the small grid.
+                nearby = profile[max(0, side - 1):side + 2]
+                if nearby.max() <= floor:
+                    return False
+    return True
 
 
 def _size(path: str | Path) -> tuple[int, int]:
@@ -154,7 +173,7 @@ def _plausible(x0, y0, x1, y1, still, light, game, share=STILL_SHARE):
     return moving
 
 
-def _local(vpeaks, hpeaks, still, light):
+def _local(vpeaks, hpeaks, still, light, edges):
     """Every rectangle the strong straight lines can make, that still looks like a camera.
 
     Returns them best first: the one whose weakest border is the strongest, and of those the bigger."""
@@ -175,7 +194,7 @@ def _local(vpeaks, hpeaks, still, light):
                     if len(score) < 2:
                         continue       # a box needs two borders of its own, or it is just the frame
                     moving = _plausible(x0, y0, x1, y1, still, light, game)
-                    if moving is None:
+                    if moving is None or not _has_borders((x0, y0, x1, y1), edges):
                         continue
                     key = (min(score), (x1 - x0) * (y1 - y0))
                     out.append({"key": key, "x": x0, "y": y0, "x1": x1, "y1": y1,
@@ -305,7 +324,7 @@ def _asked(path: str | Path, ask):
     return bool(answer.get("looked")), answer.get("box")
 
 
-def _seen(path: str | Path, box, w: int, h: int, still: np.ndarray, light: np.ndarray) -> dict | None:
+def _seen(path: str | Path, box, w: int, h: int, still: np.ndarray, light: np.ndarray, edges) -> dict | None:
     """A box the model proposed, put onto the picture's real borders and checked like any other.
 
     A model reads a picture well but places a box roughly, and it can be wrong about the whole thing. So
@@ -320,7 +339,7 @@ def _seen(path: str | Path, box, w: int, h: int, still: np.ndarray, light: np.nd
     small = (x0 * W / w, y0 * H / h, x1 * W / w, y1 * H / h)
     # The model has already said a person is here, so the picture inside is allowed to move more than a
     # measured box would be; what it may not be is the game itself.
-    if _plausible(*small, still, light, float(np.median(still)), share=1.0) is None:
+    if _plausible(*small, still, light, float(np.median(still)), share=1.0) is None or not _has_borders(small, edges):
         return None
     found = {"x": small[0], "y": small[1], "x1": small[2], "y1": small[3], "score": 0.0}
     return _finish(path, found, w, h, still)
@@ -349,9 +368,10 @@ def detect(path: str | Path, ask=None) -> dict | None:
         looked, hinted = _asked(path, ask)
         if looked and not hinted:
             return None                    # it looked, and there is no webcam on this stream
-    vx, hy = _profiles(frames)
-    vpeaks, hpeaks = _peaks(vx, 40), _peaks(hy, 40)
-    found = _local(vpeaks, hpeaks, still, light) if (vpeaks and hpeaks) else []
+    edges = _edges(frames)
+    vertical, horizontal = edges
+    vpeaks, hpeaks = _peaks(vertical.sum(axis=0), 40), _peaks(horizontal.sum(axis=1), 40)
+    found = _local(vpeaks, hpeaks, still, light, edges) if (vpeaks and hpeaks) else []
     if looked and hinted:
         # The model is better than any measurement at saying "that is a person", and worse at saying
         # exactly where the lines are. So it picks which of the measured boxes it is, and only if it
@@ -359,7 +379,7 @@ def detect(path: str | Path, ask=None) -> dict | None:
         match = max(found, key=lambda c: _overlap(c, hinted)) if found else None
         if match and _overlap(match, hinted) >= MATCH:
             return _finish(path, match, w, h, still)
-        seen = _seen(path, hinted, w, h, still, light)
+        seen = _seen(path, hinted, w, h, still, light, edges)
         if seen:
             return seen
     if not found:

@@ -7,12 +7,15 @@ import os
 import shutil
 import threading
 import time
+from pathlib import Path
 
 from . import config
 
 BUSY_CPU = float(config.env("PEAKCUT_BUSY_CPU", "82"))          # percent: above this, no extra videos are started
 MIN_FREE_RAM_GB = float(config.env("PEAKCUT_MIN_FREE_RAM_GB", "1.5"))
 MIN_FREE_DISK_GB = float(config.env("PEAKCUT_MIN_FREE_DISK_GB", "3"))
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_CGROUP_MEMBERSHIP = Path("/proc/self/cgroup")
 
 _state = {"cpu": 0.0, "ram_free": 99.0, "disk_free": 99.0, "at": 0.0}
 _force = None            # tests only: pretend the server is busy (True) or free (False)
@@ -35,6 +38,41 @@ def _cpu_times():
     return sum(v) - v[3] - v[4], sum(v)                                    # everything except idle and waiting on disk
 
 
+def _cgroup_cpu_reader():
+    """Read CPU time for the group whose quota limits this process, if there is one."""
+    path = next((line[3:] for line in _CGROUP_MEMBERSHIP.read_text().splitlines()
+                 if line.startswith("0::/")), None)
+    if path is None or ".." in Path(path).parts:
+        return None
+
+    group = _CGROUP_ROOT / path.lstrip("/")
+    limit = os.cpu_count() or float("inf")
+    stats = None
+    for directory in (group, *group.parents):
+        try:
+            quota, period = (directory / "cpu.max").read_text().split()
+            if quota != "max":
+                cores = int(quota) / int(period)
+                if 0 < cores <= limit:
+                    limit, stats = cores, directory / "cpu.stat"
+        except (OSError, ValueError, ZeroDivisionError):
+            pass
+        if directory == _CGROUP_ROOT:
+            break
+
+    if stats is None:
+        return None
+
+    def read():
+        for line in stats.read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == "usage_usec":
+                return int(value), time.monotonic_ns() * limit / 1000
+        raise ValueError("No CPU usage in cpu.stat")
+
+    return read
+
+
 def _ram_free_gb() -> float:
     if os.name == "nt":
         import ctypes
@@ -54,20 +92,30 @@ def _ram_free_gb() -> float:
 
 
 def _watch():
+    read_cpu = _cpu_times
+    last = None
     try:
-        last = _cpu_times()
-    except Exception:  # noqa: BLE001 - a system whose processor we cannot measure (a Mac): leave that out, keep the rest
-        last = None
+        limited_cpu = _cgroup_cpu_reader()
+        if limited_cpu is not None:
+            last = limited_cpu()
+            read_cpu = limited_cpu
+    except (OSError, ValueError):
+        pass
+    if last is None:
+        try:
+            last = read_cpu()
+        except Exception:  # noqa: BLE001 - keep measuring memory and disk when CPU time is unavailable
+            pass
     while True:
         time.sleep(1)
         if last is not None:
             try:
-                now = _cpu_times()
+                now = read_cpu()
                 used, total = now[0] - last[0], now[1] - last[1]
                 last = now
-                if total > 0:
+                if total > 0 and used >= 0:
                     # smoothed over a few seconds, so one short spike neither holds people up nor lets too much in
-                    _state["cpu"] = 0.55 * _state["cpu"] + 0.45 * (100.0 * used / total)
+                    _state["cpu"] = 0.55 * _state["cpu"] + 0.45 * min(100.0, 100.0 * used / total)
             except Exception:  # noqa: BLE001
                 pass
         try:
