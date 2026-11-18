@@ -156,6 +156,7 @@ PUBLIC_URL = (env("PEAKCUT_PUBLIC_URL") or f"http://127.0.0.1:{PORT}").rstrip("/
 HTTPS = PUBLIC_URL.startswith("https://")
 SESSION_DAYS = int(env("PEAKCUT_SESSION_DAYS", "30"))
 BUFFER_TIKTOK_CHANNEL_ID = env("BUFFER_TIKTOK_CHANNEL_ID", "").strip()
+DISCORD_CLIPS_WEBHOOK_URL = env("DISCORD_CLIPS_WEBHOOK_URL", "").strip()
 # Accounts are off by default: PeakCut opens straight into the dashboard, with no sign-in, which is what you want
 # on your own computer. On a server that other people can reach, set PEAKCUT_ACCOUNTS=1: everyone then signs up
 # and signs in, and each person only sees their own videos.

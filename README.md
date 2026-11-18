@@ -139,6 +139,21 @@ PeakCut saves one draft per clip and channel. It waits and retries short rate li
 back for longer waits. If Buffer may have received the request, check that channel's drafts before taking
 further action. PeakCut holds the request to prevent a duplicate.
 
+
+### Send finished clips to Discord
+
+1. In Discord, open **Edit Channel → Integrations → Webhooks** for `#clips`. Create a webhook and copy its URL.
+2. Set `DISCORD_CLIPS_WEBHOOK_URL` in PeakCut's private environment or ignored `.env`, then restart PeakCut.
+3. New clips from this PeakCut instance send their streamer, title and duration to that channel. Leave the
+   setting blank to turn off notifications. Use a team-only channel if clip titles or streamer names are private.
+
+Set `PEAKCUT_ACCOUNTS=1` and an HTTPS `PEAKCUT_PUBLIC_URL` to include a video link. Sign in to PeakCut as the
+clip's owner before opening it. Discord receives the link and clip details while the video stays in PeakCut.
+
+The worker makes up to three attempts for connection failures before sending and for Discord rate limits of up
+to a minute. The database keeps one notification per clip across restarts and remakes. If Discord may already
+have received a message, PeakCut leaves the delivery unconfirmed to avoid a duplicate.
+
 ## Admins
 
 This only matters with accounts switched on (`PEAKCUT_ACCOUNTS=1`); without them you are the owner and can do

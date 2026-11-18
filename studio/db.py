@@ -113,6 +113,16 @@ buffer_drafts = sa.Table(
 )
 
 
+discord_clips = sa.Table(
+    "discord_clips", meta,
+    sa.Column("user_id", sa.String(40), sa.ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("job_id", sa.String(60), primary_key=True),
+    sa.Column("clip_id", sa.String(60), primary_key=True),
+    sa.Column("due_at", sa.Float, index=True),                                 # empty once a worker has taken it
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+)
+
+
 admin_log = sa.Table(                                                         # what admins did, never edited
     "admin_log", meta,
     sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
