@@ -17,6 +17,7 @@ from . import alerts, auth, brain, config, creators, ctx, facecam, games, jobs, 
 _NICK = re.compile(r"(?m)^:([A-Za-z0-9_]{2,25})!")
 
 SESSIONS: dict = {}
+_start_lock = threading.Lock()
 SEG_SEC = 6           # length of each buffer piece
 PAD = 8               # seconds kept either side of a clip so it can be re-trimmed later
 CHECK_EVERY = 180     # look at the stream every 3 minutes...
@@ -87,7 +88,7 @@ def resolve(url: str) -> dict:
 
 
 def active():
-    return [s for s in SESSIONS.values() if not s.finished and not s.user_stopped]
+    return [s for s in list(SESSIONS.values()) if not s.finished and not s.user_stopped]
 
 
 def active_mine():
@@ -165,6 +166,9 @@ class Session:
         runs at a time; if the running one is stuck far past its own timeout, a new one is let through.
         """
         now = time.time()
+        if self.job.get("watch_broadcast") and not config.ai_ready():
+            self.last_check = self.t_done
+            return
         if self.ai_busy and now - self.ai_busy < config.LIVE_AI_TIMEOUT + 60:
             return
 
@@ -227,6 +231,8 @@ class Session:
         self.user_stopped = True
         self.stop_flag.set()
         with self.lock:
+            if self.job.get("watch_broadcast") and note == "Stopped by you":
+                self.job["watch_stopped"] = True
             self.job.update(status="done", stage=note)
         jobs.save(self.job)
         if self.proc and self.proc.poll() is None:
@@ -406,6 +412,7 @@ class Session:
         return True
 
     AUTO_BEFORE, AUTO_AFTER, AUTO_GAP = 30, 20, 60   # seconds of stream sent around a jump; least time between jumps
+    WATCH_BEFORE, WATCH_AFTER = 50, 35
     JUMP = 0.6                                        # 60% louder or busier than the last three minutes
 
     def _watch_spikes(self):
@@ -460,18 +467,21 @@ class Session:
         last_clip = max((c.get("made_at", 0) for c in self.job["clips"]), default=self.started_at)
         must = st["must_clip_min"] > 0 and time.time() - last_clip >= st["must_clip_min"] * 60
         verdict = {"t": round(now), "transcript": None, "reaction": None, "trigger": why}
-        if len(win) < 8:
-            self.skipped += 1
-            return self._verdict(verdict, "Skipped: nobody talking")
         if len(recent) >= st["live_per_hour"] and not must:
             self.skipped += 1
             return self._verdict(verdict, f"Skipped: {st['live_per_hour']} clips this hour already")
         usage.set_context(self.job["creator"], self.job["title"] or "Live stream")
         title, up = self.job["title"], self.job["uploader"]
+        watch = bool(self.job.get("watch_broadcast"))
+        if len(win) < 8:
+            if watch and self._visual_highlight(ws, now, why, verdict):
+                return
+            self.skipped += 1
+            return self._verdict(verdict, "Skipped: nobody talking")
         try:
             cands, tok = brain.judge_transcript(win, ws, now, title, up, st["min_len"], st["max_len"], self.job["clips"],
                                                 n=1 if every <= 2 else 2, must=must, game=self._game(),
-                                                timeout=config.LIVE_AI_TIMEOUT)  # Auto (0) asks for one
+                                                timeout=config.LIVE_AI_TIMEOUT, **({"english_only": True} if watch else {}))
         except Exception as e:  # noqa: BLE001
             self.job["ai"]["last_error"] = str(e)[-200:]
             return self._verdict(verdict, "AI error: " + str(e)[-80:])
@@ -480,6 +490,8 @@ class Session:
         keep = [c for c in cands if c["score"] >= (40 if must else st["min_score"])]
         verdict["transcript"] = max((c["score"] for c in cands), default=0)
         if not keep:
+            if watch and self._visual_highlight(ws, now, why, verdict):
+                return
             return self._verdict(verdict, "Words judge: nothing clip-worthy")
         z = brain.loud_zscore(np.array(self.db, dtype=np.float32))
         lo, hi = int(ws), int(now) + 1
@@ -508,7 +520,9 @@ class Session:
                 self.rejected += 1
                 self._verdict(verdict, "Reaction judge said no, not clipped")
                 continue
-            if any(abs(c["start"] - k["start"]) < st["min_gap_min"] * 60 for k in self.job["clips"]):
+            existing = self.job["clips"]
+            if (any(abs(c["start"] - k["start"]) < st["min_gap_min"] * 60 for k in existing)
+                    or (watch and brain._overlaps(c["start"], c["end"], existing))):
                 self._verdict(verdict, "Too close to the last clip")
                 continue
             why = "Both judges agreed" if both else ("Words judge was very sure" if c["score"] >= 90 and
@@ -521,6 +535,33 @@ class Session:
             must = False
             if added >= (1 if every <= 2 else 2):
                 break
+
+    def _visual_highlight(self, start, end, why, verdict):
+        """One image check around a strong reaction when the words didn't identify a moment."""
+        if not why or not why.startswith("Jump:"):
+            return False
+        peak = start + self.WATCH_BEFORE
+        length = min(61, self.settings["max_len"])
+        a = max(start, peak - min(36, length * 0.6))
+        b = min(end, a + length)
+        if b - a < self.settings["min_len"] or brain._overlaps(a, b, self.job["clips"]):
+            return False
+        if any(abs(a - c["start"]) < self.settings["min_gap_min"] * 60 for c in self.job["clips"]):
+            return False
+        self._scan_segments()
+        with self.lock:
+            segments = list(self.segments)
+        try:
+            jpeg = facecam.frame_strip(segments, (peak - 8, peak, min(end - 2, peak + 8)))
+            candidate, tokens = brain.judge_gameplay(jpeg, a, b, self.job["title"], self._game(), config.LIVE_AI_TIMEOUT)
+        except Exception:  # noqa: BLE001 - clip decisions still work with text-only AI or a missing frame
+            return False
+        self.tokens += tokens
+        if not candidate or candidate["score"] < self.settings["min_score"]:
+            return False
+        self._add_clip(candidate)
+        self._verdict(verdict, "Clipped: visible action near a reaction spike")
+        return True
 
     def _verdict(self, v, result):
         self.verdicts.append(dict(v, result=result))
@@ -679,7 +720,9 @@ class Session:
             busy = False
             try:
                 if not self.user_stopped and not self.ended:      # a recording cannot run for ever
-                    if time.time() - self.started_at > config.MAX_LIVE_HOURS * 3600:
+                    if self.job.get("watch_broadcast") and load.disk_full():
+                        self.stop("Watchlist recording stopped because disk space is low")
+                    elif time.time() - self.started_at > config.MAX_LIVE_HOURS * 3600:
                         self.stop(f"Stopped after {config.MAX_LIVE_HOURS:g} hours, the longest one recording can run")
                 self._scan_segments()
                 busy = self._transcribe_step()
@@ -691,6 +734,9 @@ class Session:
                 # Three ways the AI is asked: on the creator's schedule (every N minutes), and always, when the
                 # stream suddenly gets louder or chat busier, or when someone says "clip".
                 every = int(self.settings.get("ai_every_min", 3)) or 3
+                watch = self.job.get("watch_broadcast")
+                before, after = (self.WATCH_BEFORE, self.WATCH_AFTER) if watch else (self.AUTO_BEFORE, self.AUTO_AFTER)
+                interval = max(QUIET_MAX, every * 60) if watch and self.settings["ai_only_on_spike"] else every * 60
                 self._watch_spikes()
                 sp, said = self.spike, self.said
                 if self.user_stopped:
@@ -698,10 +744,10 @@ class Session:
                 elif said and (self.t_done >= said["t"] + self.SAID_AFTER or (self.ended and not busy)):
                     self.said = None
                     self._ask_ai((said["t"] - self.SAID_BEFORE, said["t"] + self.SAID_AFTER), said["why"])
-                elif sp and (self.t_done >= sp["t"] + self.AUTO_AFTER or (self.ended and not busy)):
+                elif sp and (self.t_done >= sp["t"] + after or (self.ended and not busy)):
                     self.spike = None
-                    self._ask_ai((sp["t"] - self.AUTO_BEFORE, sp["t"] + self.AUTO_AFTER), "Jump: " + sp["why"])
-                elif self.t_done - self.last_check >= every * 60 or (self.ended and not busy and self.t_done > self.last_check):
+                    self._ask_ai((sp["t"] - before, sp["t"] + after), "Jump: " + sp["why"])
+                elif self.t_done - self.last_check >= interval or (self.ended and not busy and self.t_done > self.last_check):
                     self._ask_ai()
                 self._publish()
             except Exception as e:  # noqa: BLE001
@@ -776,7 +822,17 @@ def recover(job):
     jobs.submit_live(cleanup)
 
 
-def start_session(creator: dict, url=None) -> dict:
+def start_session(creator: dict, url=None, *, watch=None, watch_limit=None) -> dict:
+    with _start_lock:
+        return _start_session(creator, url, watch, watch_limit)
+
+
+def _start_session(creator, url, watch, watch_limit):
+    if watch:
+        current = creators.get(creator["id"])
+        if not current or not current["auto_watch"] or current["channel"] != creator["channel"]:
+            raise ValueError("That channel is no longer enabled for recording.")
+        creator = current
     url = normalize(url or creator.get("channel") or "")
     if not re.match(r"^https?://[^/]+\.[^/]+/", url + "/"):
         raise ValueError("Add this creator's channel link first.")
@@ -790,14 +846,19 @@ def start_session(creator: dict, url=None) -> dict:
                                   "Twitch and Kick streams still work. YouTube"))
     if len(active_mine()) >= config.MAX_LIVE_PER_USER:
         raise ValueError(f"You're already recording {len(active_mine())} streams, the most this server allows at once. Stop one first.")
-    if len(active()) >= config.MAX_LIVE_TOTAL or (active() and load.busy()):
+    ceiling = config.MAX_LIVE_TOTAL if watch_limit is None else min(watch_limit, config.MAX_LIVE_TOTAL)
+    if len(active()) >= ceiling or (active() and load.busy()):
         raise ValueError("PeakCut is recording as many streams as it can right now. Try again in a little while.")
+    if load.disk_full():
+        raise ValueError("There is not enough disk space to start recording.")
     from . import tools
     if tools.missing():
         raise ValueError(tools.HELP)
     job = jobs.create({"type": "live", "url": url, "name": f"{creator['name']} live"}, {}, enqueue=False,
                       creator=creator["id"], kind="live")
     job.update(status="live", stage="Connecting to the stream")
+    if watch:
+        job.update(watch_broadcast=watch["broadcast"], watch_channel=creator["channel"], title=watch["title"])
     jobs.save(job)
     Session(job, creator).start()
     return job
@@ -805,7 +866,7 @@ def start_session(creator: dict, url=None) -> dict:
 
 def _watch_user(uid):
     """Start recording any of this user's auto-record creators who have gone live."""
-    from . import profiles
+    from . import watchlist
     with ctx.as_user(uid):
         try:
             todo = [c for c in creators.all_creators() if c["auto_watch"] and c["channel"]]
@@ -813,7 +874,15 @@ def _watch_user(uid):
                 return
         except Exception:  # noqa: BLE001
             return
-        for c in todo:
+        managed = sorted((c for c in todo if c.get("watchlist")), key=lambda c: c["watchlist"]["order"])
+        if managed and auth.is_verified(uid):
+            try:
+                watchlist.poll(managed)
+            except Exception:  # noqa: BLE001
+                from . import discord_clips
+                discord_clips.event("status", "watcher:" + time.strftime("%Y-%m-%d"),
+                                    "The watchlist check was interrupted. PeakCut will try again.")
+        for c in (c for c in todo if not c.get("watchlist")):
             _watch_one(c)
 
 
@@ -844,7 +913,8 @@ def _watch_one(c):
         urls = [c["channel"]] + [u for u in c.get("channels", {}).values() if u != c["channel"]]
         for url in urls:
             # one shared "are they live?" answer per channel, however many people follow it
-            if not profiles.live_shared(profiles.platform_of(url), url).get("live"):
+            status = profiles.live_shared(profiles.platform_of(url), url)
+            if not status.get("live") or status.get("error"):
                 continue
             if media.is_youtube(url):
                 # check YouTube will hand over the stream before making a recording that could only fail
@@ -912,7 +982,8 @@ def start():
             with ctx.as_user(j["user"]):
                 recover(j)
         if j.get("was_live") and j.get("creator"):
-            paused.append((j["user"], j["creator"], j["source"]["url"]))
+            if not j.get("watch_broadcast"):
+                paused.append((j["user"], j["creator"], j["source"]["url"]))
             j.pop("was_live", None)
             jobs.save(j)
     if paused:

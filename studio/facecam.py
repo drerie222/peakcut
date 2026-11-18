@@ -26,6 +26,7 @@ Only numpy and ffmpeg, which are already here.
 from __future__ import annotations
 
 import subprocess
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -300,16 +301,41 @@ def _finish(path: str | Path, found: dict, w: int, h: int, still: np.ndarray) ->
             "corner": _corner(x0, y0, x1, y1, w, h), "score": found.get("score", 0.0), "conf": conf}
 
 
-def _frame_jpeg(path: str | Path, width: int = 768) -> bytes:
+def _frame_jpeg(path: str | Path, width: int = 768, at=None) -> bytes:
     """One frame of the stream, small, as a JPEG: what a model is shown."""
     try:
         return subprocess.run(
-            ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, _duration(path) / 2.0):.1f}", "-i", str(path),
+            ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, _duration(path) / 2.0 if at is None else at):.1f}", "-i", str(path),
              "-frames:v", "1", "-vf", f"scale={width}:-2", "-pix_fmt", "yuvj420p", "-q:v", "4",
              "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
-            capture_output=True, timeout=120).stdout or b""
+            capture_output=True, timeout=120 if at is None else 10).stdout or b""
     except Exception:  # noqa: BLE001
         return b""
+
+
+def frame_strip(segments, times):
+    """Combine a few frames from the rolling buffer for a single visual check."""
+    from PIL import Image
+
+    frames = []
+    for t in times:
+        part = next(((path, start) for path, start, end in segments if start <= t < end), None)
+        if not part:
+            continue
+        raw = _frame_jpeg(part[0], width=480, at=t - part[1])
+        if raw:
+            with Image.open(BytesIO(raw)) as im:
+                frames.append(im.convert("RGB"))
+    if len(frames) < 2:
+        return b""
+    sheet = Image.new("RGB", (480, sum(im.height for im in frames)))
+    offset = 0
+    for im in frames:
+        sheet.paste(im, (0, offset))
+        offset += im.height
+    result = BytesIO()
+    sheet.save(result, format="JPEG", quality=80)
+    return result.getvalue()
 
 
 def _asked(path: str | Path, ask):

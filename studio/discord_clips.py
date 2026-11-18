@@ -1,5 +1,6 @@
 """Send finished-clip notifications from a separate worker."""
 import http.client
+import hashlib
 import json
 import logging
 import math
@@ -26,34 +27,45 @@ def _webhook_path(url):
 
 
 _WEBHOOK_PATH = _webhook_path(config.DISCORD_CLIPS_WEBHOOK_URL)
+_EVENT_PATHS = {"live": _webhook_path(config.DISCORD_LIVE_WEBHOOK_URL),
+                "status": _webhook_path(config.DISCORD_STATUS_WEBHOOK_URL)}
 
 
 def enqueue(job, clip):
     """Remember this clip once, even if two workers report it at the same time."""
     if not _WEBHOOK_PATH:
         return
+    _enqueue(_pending, user_id=job["user"], job_id=job["id"], clip_id=clip["id"])
+
+
+def event(feed, event_id, message):
+    path = _WEBHOOK_PATH if feed == "clips" else _EVENT_PATHS.get(feed)
+    if path:
+        digest = hashlib.sha256(event_id.encode()).hexdigest()
+        _enqueue(db.discord_events, user_id=ctx.uid(), feed=feed, event_id=digest, message=message[:1000])
+
+
+def _enqueue(table, **values):
     try:
         with db.engine.begin() as cn:
             insert = sqlite.insert if cn.dialect.name == "sqlite" else postgresql.insert
-            cn.execute(insert(_pending).values(user_id=job["user"], job_id=job["id"], clip_id=clip["id"],
-                                              due_at=db.now()).on_conflict_do_nothing())
+            cn.execute(insert(table).values(**values, due_at=db.now()).on_conflict_do_nothing())
     except Exception:  # noqa: BLE001 - a notification error must not fail the clip
         _log.warning("Could not queue a Discord clip notification.")
     else:
         _wake.set()
 
 
-def _key(row):
-    return sa.and_(_pending.c.user_id == row.user_id, _pending.c.job_id == row.job_id,
-                   _pending.c.clip_id == row.clip_id)
+def _key(table, row):
+    return sa.and_(*(col == row._mapping[col.key] for col in table.primary_key))
 
 
-def _claim():
-    due = _pending.c.due_at <= db.now()
+def _claim(table, *filters):
+    due = table.c.due_at <= db.now()
     with db.engine.begin() as cn:
-        row = cn.execute(sa.select(_pending).where(due).order_by(_pending.c.due_at).limit(1)).first()
+        row = cn.execute(sa.select(table).where(due, *filters).order_by(table.c.due_at).limit(1)).first()
         # Record the attempt before sending. A restart cannot safely replay an unconfirmed request.
-        if row and cn.execute(_pending.update().where(_key(row), due, _pending.c.attempts == row.attempts)
+        if row and cn.execute(table.update().where(_key(table, row), due, table.c.attempts == row.attempts)
                               .values(due_at=None, attempts=row.attempts + 1)).rowcount == 1:
             return row
     return None
@@ -119,14 +131,14 @@ def _post(path, payload):
         conn.close()
 
 
-def _send_next(path):
-    row = _claim()
+def _send_next(path, table=_pending, feeds=None):
+    row = _claim(table, table.c.feed.in_(feeds)) if feeds else _claim(table)
     if row is None:
         return False
-    payload = _payload(row)
+    payload = {"content": row.message, "allowed_mentions": {"parse": []}} if feeds else _payload(row)
     if payload is None:
         return True
-    delay = _post(path, payload)
+    delay = _post(feeds[row.feed] if feeds else path, payload)
     if delay is None:
         return True
     attempts = row.attempts + 1
@@ -134,15 +146,15 @@ def _send_next(path):
         _log.warning("Discord clip notification ran out of attempts.")
     else:
         with db.engine.begin() as cn:
-            cn.execute(_pending.update().where(_key(row)).values(due_at=db.now() + max(delay, 2 ** attempts)))
+            cn.execute(table.update().where(_key(table, row)).values(due_at=db.now() + max(delay, 2 ** attempts)))
     return True
 
 
-def _run(path):
+def _run(path, feeds=None):
     while True:
         _wake.clear()
         try:
-            while _send_next(path):
+            while (_send_next(None, db.discord_events, feeds) if feeds else _send_next(path)):
                 pass
         except Exception:  # noqa: BLE001 - neither exception details nor the webhook may go into logs
             _log.warning("Could not process a Discord clip notification.")
@@ -154,3 +166,6 @@ def start():
         threading.Thread(target=_run, args=(_WEBHOOK_PATH,), daemon=True, name="discord-clips").start()
     elif config.DISCORD_CLIPS_WEBHOOK_URL:
         _log.warning("DISCORD_CLIPS_WEBHOOK_URL must be an HTTPS webhook on discord.com.")
+    feeds = {feed: path for feed, path in {**_EVENT_PATHS, "clips": _WEBHOOK_PATH}.items() if path}
+    if feeds:
+        threading.Thread(target=_run, args=(None, feeds), daemon=True, name="discord-events").start()

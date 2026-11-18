@@ -123,6 +123,17 @@ discord_clips = sa.Table(
 )
 
 
+discord_events = sa.Table(
+    "discord_events", meta,
+    sa.Column("user_id", sa.String(40), sa.ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("feed", sa.String(16), primary_key=True),
+    sa.Column("event_id", sa.String(64), primary_key=True),
+    sa.Column("message", sa.Text, nullable=False),
+    sa.Column("due_at", sa.Float, index=True),
+    sa.Column("attempts", sa.Integer, nullable=False, server_default="0"),
+)
+
+
 admin_log = sa.Table(                                                         # what admins did, never edited
     "admin_log", meta,
     sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),

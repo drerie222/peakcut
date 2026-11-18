@@ -20,7 +20,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from . import admin as admins
-from . import account, load
+from . import account, load, watchlist
 from . import (accounts, ai, alerts, auth, buffer, config, creators, ctx, db, discord_clips, jobs, live, media, posting,
                profiles, render, safe, transcribe, usage)
 
@@ -70,6 +70,7 @@ def _startup():
         from . import fetch_model
         threading.Thread(target=lambda: _quiet(fetch_model.ensure), daemon=True).start()
     jobs.on_clip_ready.append(discord_clips.enqueue)
+    watchlist.start()
     jobs.start()
     discord_clips.start()
     live.start()
@@ -578,6 +579,8 @@ def status(request: Request):
     me_ = _me(request)
     return {"user": auth.public(me_), "update": updates.latest() if me_.is_admin else None, "accounts": config.ACCOUNTS, "disk_full": load.disk_full(), "no_ffmpeg": bool(_tools.missing()), "links": {"repo": config.REPO_URL, "follow": config.FOLLOW_URL}, "ai": usage.brief(), "unread": notices.unread(),
             "tour": not accounts.settings()["tour_done"], "buffer_drafts": bool(me_.is_admin and buffer.configured()),
+            "watchlist": {"limit": watchlist.recording_limit(), "ceiling": min(30, config.MAX_LIVE_TOTAL, config.MAX_LIVE_PER_USER),
+                          "buffer": bool(me_.is_admin and accounts.settings()["watch_buffer"])},
             "youtube": accounts.youtube_ready(), "connect": {p: accounts.can_connect(p) for p in accounts.PLATFORM_NAMES}, "max_upload_mb": config.MAX_UPLOAD_MB, "upload_part_mb": config.UPLOAD_PART_MB, "max_batch": config.MAX_ACTIVE_JOBS_PER_USER,
             "styles": {k: v["label"] for k, v in render.STYLES.items()}, "layouts": render.LAYOUTS}
 
@@ -643,7 +646,7 @@ def _lookup(fn, *a):
 def _creator_rows():
     out = []
     for c in creators.all_creators():
-        if profiles.needs_refresh(c):
+        if not c.get("watchlist") and profiles.needs_refresh(c):
             profiles.refresh(c["id"])
         s = live.active_for(c["id"])
         out.append({**c, "live_job": s.job["id"] if s else None, "log": creators.read_log(c["id"], 30)})
@@ -660,7 +663,7 @@ def _sync_unchanged(v: str):
     if mine is None or not v or v != _sync_token():
         return None
     for c in list(mine.values()):                      # still keep live status fresh while the page is open
-        if profiles.needs_refresh(c):
+        if not c.get("watchlist") and profiles.needs_refresh(c):
             profiles.refresh(c["id"])
     return {"v": v}
 
@@ -1168,6 +1171,23 @@ def list_creators():
     return _creator_rows()
 
 
+@app.post("/api/watchlist/import")
+def import_watchlist():
+    _need_verified()
+    return {"added": watchlist.seed()}
+
+
+@app.put("/api/admin/watchlist")
+def watchlist_settings(request: Request, body: dict = Body(...)):
+    _admin(request)
+    try:
+        settings = accounts.save_settings({k: body[k] for k in ("watch_recordings", "watch_buffer") if k in body})
+    except (ValueError, TypeError, OverflowError):
+        raise HTTPException(400, "Enter a recording limit between 1 and 30.") from None
+    return {"limit": watchlist.recording_limit(), "ceiling": min(30, config.MAX_LIVE_TOTAL, config.MAX_LIVE_PER_USER),
+            "buffer": settings["watch_buffer"]}
+
+
 @app.post("/api/creators")
 def new_creator(body: dict = Body(...)):
     _channel_ok(body)
@@ -1195,6 +1215,10 @@ def edit_creator(cid: str, body: dict = Body(...)):
     s = live.active_for(cid)
     if s:
         s.settings = c  # new settings apply to the running recording straight away
+    if c.get("watchlist"):
+        if s and not c["auto_watch"] and s.job.get("watch_broadcast"):
+            s.stop("Watchlist monitoring disabled")
+        return c
     if "channels" in body or "channel" in body:
         profiles.refresh(cid, force=True)
     if body.get("auto_watch") and c.get("auto_watch") and not s:

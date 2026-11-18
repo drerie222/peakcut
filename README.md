@@ -154,6 +154,11 @@ The worker makes up to three attempts for connection failures before sending and
 to a minute. The database keeps one notification per clip across restarts and remakes. If Discord may already
 have received a message, PeakCut leaves the delivery unconfirmed to avoid a duplicate.
 
+### Gaming watchlist
+
+Open **Watchlist → Import 30 streamers**. Enable individual channels and edit their links or clip settings in
+the creator's **Setup**. See the [watchlist setup and limits](GAMING.md#gaming-watchlist).
+
 ## Admins
 
 This only matters with accounts switched on (`PEAKCUT_ACCOUNTS=1`); without them you are the owner and can do

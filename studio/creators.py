@@ -134,7 +134,7 @@ def _write(c):
     ctx.bump()
 
 
-def create(data: dict) -> dict:
+def create(data: dict, *, watchlist=None) -> dict:
     c = _fix({**DEFAULTS, **_clean(data)})
     if not c["name"]:
         raise ValueError("Give the creator a name.")
@@ -143,6 +143,8 @@ def create(data: dict) -> dict:
     while root(cid).exists():
         cid, n = f"{slug}-{n}", n + 1
     c.update(id=cid, created=time.time())
+    if watchlist:
+        c["watchlist"] = watchlist
     _write(c)
     log(cid, f"Workspace created for {c['name']}")
     return c
@@ -152,6 +154,7 @@ def update(cid, data: dict) -> dict:
     c = get(cid)
     if not c:
         raise KeyError(cid)
+    old_channel = c["channel"]
     new = _clean(data)
     if "channels" in new and "channel" not in new and c["channel"] not in new["channels"].values():
         c["channel"] = ""  # the recording channel was removed: fall back to another one
@@ -159,10 +162,34 @@ def update(cid, data: dict) -> dict:
         new["channels"] = {**c["channels"], platform_key(new["channel"]): new["channel"]}
     c.update(new)
     _fix(c)
+    if c.get("watchlist"):
+        from .watchlist import channel_url
+        for url in c["channels"].values():
+            channel_url(url)
+        if c["channel"] != old_channel:
+            c.pop("watch_status", None)
     if c["min_len"] >= c["max_len"]:
         raise ValueError("Shortest clip must be shorter than longest clip.")
     _write(c)
     return c
+
+
+def watch_status(cid, channel, status):
+    """Save a result only while the original recording channel is still enabled."""
+    with _lock:
+        current = get(cid)
+        if not current or not current["auto_watch"] or current["channel"] != channel:
+            return None
+        if current.get("watch_status") != status:
+            current["watch_status"] = status
+            if status["state"] != "unknown":
+                plat = platform_key(channel)
+                profile = dict((current.get("profiles") or {}).get(plat, {}))
+                profile.update(channel=channel, platform=plat.title(), live=status["state"] == "live",
+                               title=status["title"], embed=status["embed"], started=status["started"])
+                current.setdefault("profiles", {})[plat] = current["profile"] = profile
+            _write(current)
+        return current
 
 
 def set_profiles(cid, profiles: dict, extra: dict = None):
