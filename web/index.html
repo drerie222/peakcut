@@ -2128,7 +2128,33 @@ async function drawSettings() {
 async function saveSettings() { const d = {}; $$("#sform [data-s]").forEach(i => d[i.dataset.s] = i.value); await send("/api/settings", d, "PUT"); }
 
 /* ============================================================ clip editor */
-function openClip(jid, cid) { D.jid = jid; D.cid = cid; D.sig = ""; drawClipDlg(true); $("#clipdlg").showModal(); }
+function openClip(jid, cid) {
+  D.jid = jid; D.cid = cid; D.sig = ""; D.buffer = null;
+  drawClipDlg(true); $("#clipdlg").showModal(); loadBufferDraft();
+}
+function bufferPath() {
+  return `/api/admin/jobs/${encodeURIComponent(D.jid)}/clips/${encodeURIComponent(D.cid)}/buffer-draft`;
+}
+function drawBufferDraft(c) {
+  if (!S.status.buffer_drafts) return;
+  const draft = D.buffer;
+  put($("#buffer-draft"), c.status !== "done" && !draft?.video_link ? "" : `
+    <h3>Buffer · TikTok</h3>
+    ${!draft ? "" : draft.state === "draft" ? `<p class="help">Draft saved in Buffer.</p>`
+      : draft.state === "unconfirmed" ? `<p class="help">Check the draft in Buffer before trying again.</p>`
+      : c.status === "done" ? `<button class="btn" data-act="buffer-save">Save TikTok draft</button>` : ""}
+    ${draft?.video_link ? `<button class="btn" data-act="buffer-revoke">Revoke Buffer video link</button>` : ""}`);
+}
+async function loadBufferDraft() {
+  if (!S.status.buffer_drafts || !D.jid) return;
+  const path = bufferPath();
+  try {
+    const state = await api(path);
+    if (D.jid && bufferPath() === path) { D.buffer = state; drawClipDlg(false); }
+  } catch (err) {
+    if (D.jid && bufferPath() === path) toast(err.message, "bad");
+  }
+}
 function drawClipDlg(full) {
   const j = jobOf(D.jid), c = j?.clips.find(x => x.id === D.cid), dlg = $("#clipdlg");
   if (!c) { if (dlg.open) dlg.close(); return; }
@@ -2157,6 +2183,7 @@ function drawClipDlg(full) {
         ${S.accounts.length ? `<div class="row">${S.accounts.map(a => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}">${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>
           <div class="row"><button class="btn primary" data-act="postnow">${ic("send")}Post now</button><button class="btn" data-act="postqueue">Add to queue</button></div>`
           : `<p class="help">No accounts connected yet. Connect one in Settings.</p>`}
+        ${S.status.buffer_drafts ? `<div id="buffer-draft"></div>` : ""}
         <div class="row" style="margin-top:auto;padding-top:8px;border-top:1px solid var(--line)">
           ${c.status === "done" ? `<a class="btn" href="${m}${esc(c.file)}?download=1">${ic("down")}Download</a>` : ""}
           <button class="btn" data-act="copy" data-j="${j.id}" data-c="${esc(c.id)}">${ic("copy")}Copy post text</button></div>
@@ -2164,6 +2191,7 @@ function drawClipDlg(full) {
   } else if (D.sig !== sig) $("#stage").innerHTML = stage;
   D.sig = sig;
   put($("#dposts"), postPills(c));
+  drawBufferDraft(c);
 }
 $("#clipdlg").addEventListener("close", () => { $("#clipdlg").innerHTML = ""; D.jid = null; });
 $("#clipdlg").addEventListener("click", e => { if (e.target === e.currentTarget) e.currentTarget.close(); });
@@ -2463,6 +2491,24 @@ document.addEventListener("click", async e => {
         body[i.dataset.f] = i.type === "checkbox" ? i.checked : i.type === "number" ? Number(i.value) : i.value;
       });
       await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); toast("Re-making the clip…", "ok"); return tick();
+    }
+    if (a === "buffer-save" || a === "buffer-revoke") {
+      const path = bufferPath(), save = a === "buffer-save";
+      const caption = save ? {title: $("#clipdlg [data-f=title]").value,
+                              description: $("#clipdlg [data-f=description]").value} : null;
+      b.disabled = true;
+      try {
+        const confirmed = save ? await ask("Save a TikTok draft?", "Buffer will receive this clip and its post text for review.", "Save draft")
+          : await ask("Revoke the video link?", "Buffer may need a replacement video if you still want to use this draft.", "Revoke link", true);
+        if (!confirmed || !D.jid || bufferPath() !== path) return;
+        const state = save ? await send(path, caption) : await api(path, {method:"DELETE"});
+        if (D.jid && bufferPath() === path) { D.buffer = state; drawClipDlg(false); }
+        toast(save ? "Draft saved in Buffer" : "Buffer video link revoked", "ok");
+      } catch (err) {
+        if (D.jid && bufferPath() === path) loadBufferDraft();
+        throw err;
+      } finally { b.disabled = false; }
+      return;
     }
     if (a === "postnow" || a === "postqueue") {
       const accs = $$("#clipdlg [data-pacc]:checked").map(i => i.value);

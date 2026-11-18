@@ -113,6 +113,32 @@ Everything is set through environment variables, normally in a `.env` file next 
 
 `.env`, the `secrets/` folder and all user data are ignored by git. Keep keys there, never in the code.
 
+### Save a TikTok draft in Buffer
+
+1. In Buffer, keep your existing TikTok channel connected. In **Settings → API**, create a personal API key
+   as a Buffer organization owner with permission to view and create drafts on that channel. Buffer keys
+   inherit the user's access across organizations. Use Buffer's channel lookup to find the ID whose service
+   is `tiktok`. API access is included on the Free plan.
+   [API access](https://support.buffer.com/articles/using-buffers-api-GtIYIQilz5) ·
+   [Permissions](https://developers.buffer.com/guides/authentication.html) ·
+   [Find a channel ID](https://developers.buffer.com/guides/your-first-post.html)
+2. Set `BUFFER_API_KEY` in PeakCut's private environment or ignored `.env`, and set
+   `BUFFER_TIKTOK_CHANNEL_ID` to the selected channel ID. Run PeakCut with `PEAKCUT_ACCOUNTS=1` and set
+   `PEAKCUT_PUBLIC_URL` to its publicly reachable HTTPS origin. Allow outbound HTTPS to `api.buffer.com`
+   and allow Buffer to fetch `/pub/buffer/` without a login. Keep that path out of reverse proxy access logs.
+3. Restart PeakCut. As a PeakCut administrator, open one of your finished clips, review its title and description,
+   then select **Save TikTok draft**. TikTok video captions combine both fields. Find the result under **Drafts**
+   for the TikTok channel in Buffer, where you can review and publish it by hand.
+
+Buffer needs a direct video link that stays reachable during review. PeakCut sends an unguessable link for one
+rendered version. Keep it available while Buffer needs the video. **Revoke Buffer video link** turns off access
+through that link. Deleting or remaking the clip also makes the old link unusable. Revoking a link keeps the
+draft in Buffer. [Buffer media requirements](https://developers.buffer.com/guides/hosting-media.html)
+
+PeakCut saves one draft per clip and channel. It waits and retries short rate limits, and shows when to come
+back for longer waits. If Buffer may have received the request, check that channel's drafts before taking
+further action. PeakCut holds the request to prevent a duplicate.
+
 ## Admins
 
 This only matters with accounts switched on (`PEAKCUT_ACCOUNTS=1`); without them you are the owner and can do

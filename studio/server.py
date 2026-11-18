@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from . import admin as admins
 from . import account, load
-from . import (accounts, ai, alerts, auth, config, creators, ctx, db, jobs, live, media, posting,
+from . import (accounts, ai, alerts, auth, buffer, config, creators, ctx, db, jobs, live, media, posting,
                profiles, render, safe, transcribe, usage)
 
 from . import tools as _tools  # noqa: E402
@@ -575,7 +575,7 @@ def status(request: Request):
     from . import updates
     me_ = _me(request)
     return {"user": auth.public(me_), "update": updates.latest() if me_.is_admin else None, "accounts": config.ACCOUNTS, "disk_full": load.disk_full(), "no_ffmpeg": bool(_tools.missing()), "links": {"repo": config.REPO_URL, "follow": config.FOLLOW_URL}, "ai": usage.brief(), "unread": notices.unread(),
-            "tour": not accounts.settings()["tour_done"],
+            "tour": not accounts.settings()["tour_done"], "buffer_drafts": bool(me_.is_admin and buffer.configured()),
             "youtube": accounts.youtube_ready(), "connect": {p: accounts.can_connect(p) for p in accounts.PLATFORM_NAMES}, "max_upload_mb": config.MAX_UPLOAD_MB, "upload_part_mb": config.UPLOAD_PART_MB, "max_batch": config.MAX_ACTIVE_JOBS_PER_USER,
             "styles": {k: v["label"] for k, v in render.STYLES.items()}, "layouts": render.LAYOUTS}
 
@@ -1384,6 +1384,15 @@ def public_clip(token: str):
     return FileResponse(f, media_type="video/mp4", headers={"Cache-Control": "private, no-store"})
 
 
+@app.api_route("/pub/buffer/{token}.mp4", methods=["GET", "HEAD"])
+def buffer_video(token: str):
+    path = buffer.video_file(token)
+    if not path:
+        raise HTTPException(404)
+    return FileResponse(path, media_type="video/mp4",
+                        headers={"Cache-Control": "private, no-store", "X-Robots-Tag": "noindex, nofollow"})
+
+
 # ---------------------------------------------------------------- where PeakCut keeps everything (Settings, Storage)
 def _on_this_computer(request: Request) -> bool:
     """Is the person sitting at the computer PeakCut runs on? Only then can a folder window be opened for them."""
@@ -1459,6 +1468,45 @@ def add_posts(body: dict = Body(...)):
     if not made:
         raise HTTPException(400, "Nothing was queued. Pick at least one account this clip has not already gone to.")
     return {"queued": len(made)}
+
+
+def _buffer_clip(request: Request, jid: str, cid: str):
+    _admin(request)
+    job = _job_or_404(jid)
+    clip = next((c for c in job["clips"] if c["id"] == cid), None)
+    if clip is None:
+        raise HTTPException(404, "No such clip")
+    return job, clip
+
+
+@app.get("/api/admin/jobs/{jid}/clips/{cid}/buffer-draft")
+def buffer_draft_status(request: Request, jid: str, cid: str):
+    _, clip = _buffer_clip(request, jid, cid)
+    return buffer.status(jid, clip)
+
+
+@app.post("/api/admin/jobs/{jid}/clips/{cid}/buffer-draft")
+def save_buffer_draft(request: Request, jid: str, cid: str, body: dict = Body(default={})):
+    job, clip = _buffer_clip(request, jid, cid)
+    if body.keys() - {"title", "description"}:
+        raise HTTPException(400, "Only the draft title and description can be changed here.")
+    try:
+        result = buffer.create(job, clip, body.get("title"), body.get("description"))
+    except buffer.Error as exc:
+        if exc.uncertain:
+            ctx.bump()
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+        raise HTTPException(exc.status, str(exc), headers=headers) from None
+    ctx.bump()
+    return result
+
+
+@app.delete("/api/admin/jobs/{jid}/clips/{cid}/buffer-draft")
+def revoke_buffer_link(request: Request, jid: str, cid: str):
+    _, clip = _buffer_clip(request, jid, cid)
+    buffer.revoke(jid, cid)
+    ctx.bump()
+    return buffer.status(jid, clip)
 
 
 @app.post("/api/posts/{pid}/{action}")

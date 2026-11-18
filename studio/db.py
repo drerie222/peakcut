@@ -101,6 +101,18 @@ notices = sa.Table(                                                           # 
 )
 
 
+buffer_drafts = sa.Table(
+    "buffer_drafts", meta,
+    sa.Column("user_id", sa.String(40), sa.ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    sa.Column("job_id", sa.String(60), primary_key=True),
+    sa.Column("clip_id", sa.String(60), primary_key=True),
+    sa.Column("channel_id", sa.Text, primary_key=True),
+    sa.Column("version", sa.Integer, nullable=False),
+    sa.Column("media_hash", sa.String(64), unique=True),
+    sa.Column("post_id", sa.Text),                                           # empty while the outcome is unknown
+)
+
+
 admin_log = sa.Table(                                                         # what admins did, never edited
     "admin_log", meta,
     sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
