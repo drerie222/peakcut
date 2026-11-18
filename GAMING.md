@@ -164,8 +164,8 @@ suite as *"knowing which game a stream is"*.
 1. Open **Watchlist** and select **Import 30 streamers**. The A, B and C entries are regular creator workspaces.
    Importing again keeps edited links and settings. New entries start disabled. Enable channels you have permission
    to record and reuse. **Edit** opens the existing creator setup, where you can change the channel, gameplay
-   layout or clip duration.
-2. Set the recording limit in Watchlist. The server allows three simultaneous recordings by default.
+   layout, clip duration or priority.
+2. Set the recording limit in Watchlist. The server allows one simultaneous recording by default.
    Change `PEAKCUT_MAX_LIVE` and restart PeakCut to raise the server ceiling. A lower Watchlist limit also applies
    to new automatic recordings. CPU, free memory and disk space can delay recording while checks continue.
 3. For Discord, inject `DISCORD_CLIPS_WEBHOOK_URL` for **#clips**, `DISCORD_LIVE_WEBHOOK_URL` for **#live-streams**
@@ -177,10 +177,12 @@ suite as *"knowing which game a stream is"*.
    Finished, scored highlights from automatic watchlist recordings are exported for manual review in Buffer.
    The link stays available for that rendered version until it is revoked or the clip changes.
 
-PeakCut checks active entries about every two minutes. The shared cache and rate-limit backoff apply across
-users. Priority A gets the first available slots, followed by B and C, without interrupting recordings already in
-progress. A failed check is shown as delayed. A recording that fails to start can be tried up to three times
-per broadcast. Disabling a streamer stops that streamer's watchlist recording.
+PeakCut checks active entries about every two minutes and spaces new platform requests. Its shared cache and
+rate-limit backoff apply across users. Selection considers priority, GTA VI category or title, time waiting,
+recording time and finished clips. The watchlist shows the score and the current reason. With one recording
+slot, a waiting streamer gets a turn after 60 minutes by default. Earlier switches require a sustained lead,
+minimum recording time and cooldown. A failed start can be retried up to three times per broadcast. Disabling
+a streamer stops that streamer's watchlist recording. See the [Hetzner operating profile](HETZNER.md).
 
 The watchlist uses the live transcript and the existing loudness and chat judges. When a strong reaction has no
 clear spoken highlight, a vision-capable model can check a few buffered frames. Selected windows include setup and

@@ -1846,6 +1846,7 @@ function drawCreatorForm() {
   const A = S.accounts;
   box.innerHTML = `<div class="card"><h2>Their stream</h2><p class="help">Where to record from, and whether to start by itself.</p>
       <div class="chans">${channelRows(c)}</div>
+      ${c.watchlist ? `<label class="f">Watchlist priority<select data-k="watch_priority">${opts({A:"A · High", B:"B · Normal", C:"C · Low"}, c.watchlist.priority)}</select></label>` : ""}
       <div class="fields" style="margin-top:14px"><label class="sw span"><input type="checkbox" data-k="auto_watch" ${c.auto_watch ? "checked" : ""}><span>Record automatically when they go live<small>Checks straight away, then every two minutes.</small></span></label></div></div>
     <div class="card"><h2>How the AI decides</h2><p class="help">Two separate AI checks. The words judge reads only what was said. The reaction judge sees only how loud the streamer got and how busy chat was, never the words.</p>
       <div class="fields">
@@ -1867,7 +1868,7 @@ function drawCreatorForm() {
         <label class="f">Longest clip (seconds)<input data-k="max_len" type="number" value="${c.max_len}"></label>
         <label class="f">Clips per video<input data-k="max_clips" type="number" value="${c.max_clips}"></label>
         <label class="f">Minutes of live stream to keep<input data-k="buffer_min" type="number" value="${c.buffer_min}"></label></div></div>
-    <div class="card"><h2>Posting</h2><p class="help">${A.length ? "Choose the accounts this creator's clips go to. One account can be shared by several creators." : "No accounts are connected yet. Connect one in Settings, then come back."}</p>
+    <div class="card" ${S.status.draft_only ? 'style="display:none"' : ""}><h2>Posting</h2><p class="help">${A.length ? "Choose the accounts this creator's clips go to. One account can be shared by several creators." : "No accounts are connected yet. Connect one in Settings, then come back."}</p>
       ${A.length ? `<div class="row" style="margin-bottom:16px">${A.map(a => `<label class="ck"><input type="checkbox" data-acc value="${esc(a.id)}" ${c.accounts.includes(a.id) ? "checked" : ""}>${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>` : `<button class="btn" data-act="go" data-v="settings" style="margin-bottom:16px">${ic("cog")}Open Settings</button>`}
       <div class="fields"><label class="sw span"><input type="checkbox" data-k="autopost" ${c.autopost ? "checked" : ""}><span>Post new clips automatically<small>Clips that score high enough go out without you approving them.</small></span></label>
         <label class="f">Only auto-post clips scoring at least<input data-k="post_min_score" type="number" min="0" max="100" value="${c.post_min_score}"></label>
@@ -2142,7 +2143,8 @@ function drawBufferDraft(c) {
   const draft = D.buffer;
   put($("#buffer-draft"), c.status !== "done" && !draft?.video_link ? "" : `
     <h3>Buffer · TikTok</h3>
-    ${!draft ? "" : draft.state === "draft" ? `<p class="help">Draft saved in Buffer.</p>`
+    ${!draft ? "" : draft.state === "draft" ? `<p class="help">Buffer status: ${esc(draft.publication?.replaceAll("_", " ") || "draft")}.</p>
+      <button class="btn" data-act="buffer-refresh">Check publication status</button>`
       : draft.state === "unconfirmed" ? `<p class="help">Check the draft in Buffer before trying again.</p>`
       : c.status === "done" ? `<button class="btn" data-act="buffer-save">Save TikTok draft</button>` : ""}
     ${draft?.video_link ? `<button class="btn" data-act="buffer-revoke">Revoke Buffer video link</button>` : ""}`);
@@ -2179,10 +2181,11 @@ function drawClipDlg(full) {
         <h3>Post text</h3>
         <label class="f">Title<input data-f="title" value="${esc(c.title)}"></label>
         <label class="f">Description<textarea data-f="description" rows="2">${esc(c.description)}</textarea></label>
-        <button class="btn" data-act="remake">${ic("scissors")}Save and re-make clip</button>
-        <h3>Post it</h3>
+        ${c.raw_expired ? '<p class="help">The raw recording has expired. The finished clip is still available.</p>'
+          : `<button class="btn" data-act="remake">${ic("scissors")}Save and re-make clip</button>`}
+        <h3>${S.status.draft_only ? "Review and export" : "Post it"}</h3>
         <div id="dposts" class="row" style="gap:4px"></div>
-        ${S.accounts.length ? `<div class="row">${S.accounts.map(a => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}">${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>
+        ${S.status.draft_only ? "" : S.accounts.length ? `<div class="row">${S.accounts.map(a => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}">${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>
           <div class="row"><button class="btn primary" data-act="postnow">${ic("send")}Post now</button><button class="btn" data-act="postqueue">Add to queue</button></div>`
           : `<p class="help">No accounts connected yet. Connect one in Settings.</p>`}
         ${S.status.buffer_drafts ? `<div id="buffer-draft"></div>` : ""}
@@ -2201,7 +2204,7 @@ $("#clipdlg").addEventListener("click", e => { if (e.target === e.currentTarget)
 /* ============================================================ render + polling */
 function drawWatchlist() {
   const rows = S.creators.filter(c => c.watchlist).sort((a, b) => a.watchlist.order - b.watchlist.order);
-  const settings = S.status.watchlist || {limit:3, ceiling:3};
+  const settings = S.status.watchlist || {limit:1, ceiling:1};
   const byCreator = new Map();
   for (const job of S.jobs) {
     if (!job.watch_broadcast) continue;
@@ -2227,14 +2230,20 @@ function drawWatchlist() {
         : ({live:"Live",offline:"Offline",unknown:"Check delayed"})[s.state] || "Awaiting check";
       const done = clips.filter(k => k.status === "done").length;
       const processing = clips.filter(k => ["queued","rendering"].includes(k.status)).length;
-      const drafts = clips.filter(k => k.watch_export?.state === "draft").length;
+      const drafts = clips.filter(k => k.watch_export?.state === "draft" && k.buffer_remote_status !== "sent").length;
+      const sent = clips.filter(k => k.buffer_remote_status === "sent").length;
       const exports = clips.filter(k => k.watch_export?.state === "queued").length;
+      const decision = c.auto_watch ? S.watchDecisions?.[c.id] : null;
       return `<tr><td class="c-main" data-l="Streamer"><button class="lnk" data-act="go" data-v="c:${esc(c.id)}">${esc(c.name)}</button>
         <span class="sub">Priority ${esc(c.watchlist.priority)}</span></td>
         <td data-l="Stream"><span>${esc(active)} · ${esc(s.platform || Object.keys(c.channels)[0] || "No channel")}</span>
-        ${c.auto_watch && s.title ? `<span class="sub">${esc(s.title)}</span>` : ""}</td>
+        ${c.auto_watch && s.title ? `<span class="sub">${esc(s.title)}</span>` : ""}
+        ${c.auto_watch && s.category ? `<span class="sub">${esc(s.category)}</span>` : ""}
+        ${decision ? `<span>${esc(decision.reason)}</span>${decision.factors ? `<details><summary>Selection · ${decision.points} points</summary>
+          ${decision.factors.map(([label, points]) => `<div class="sub">${esc(label)} · ${points > 0 ? "+" : ""}${points}</div>`).join("")}
+          </details>` : ""}` : ""}</td>
         <td data-l="Highlights and clips"><span>${clips.filter(k => k.score > 0).length} highlights · ${done} ready · ${processing} processing</span>
-        ${drafts || exports ? `<span class="sub">${drafts} Buffer drafts · ${exports} waiting</span>` : ""}
+        ${drafts || exports || sent ? `<span class="sub">${drafts} Buffer drafts · ${exports} waiting · ${sent} sent</span>` : ""}
         ${lastError ? `<span class="err">${esc(lastError)}</span>` : ""}</td>
         <td class="c-act"><div class="row"><button class="btn sm" data-act="watch-toggle" data-c="${esc(c.id)}"
           aria-label="${c.auto_watch ? "Disable" : "Enable"} ${esc(c.name)}">${c.auto_watch ? "Disable" : "Enable"}</button>
@@ -2262,6 +2271,7 @@ async function tick() {
     // a server from before multi-channel support sends only `channel`: show it as that platform's channel
     creators.forEach(c => { if (!c.channels) { const u = c.channel || "", k = /youtu/i.test(u) ? "youtube" : /twitch/i.test(u) ? "twitch" : /kick/i.test(u) ? "kick" : ""; c.channels = k ? {[k]: u} : {}; } });
     S.jobs = jobs; S.creators = creators; S.accounts = accounts;
+    S.watchDecisions = got.watch_decisions || {};
     if (got.ai) S.status.ai = got.ai;
     if (got.unread != null) S.status.unread = got.unread;
     if (S.view === "overview") { S.overview = await api("/api/overview"); S.ovAt = Date.now(); }
@@ -2553,6 +2563,15 @@ document.addEventListener("click", async e => {
           drawWatchlist();
           toast("Watchlist settings saved", "ok");
         }
+        await tick();
+      } finally { b.disabled = false; }
+      return;
+    }
+    if (a === "buffer-refresh") {
+      const path = bufferPath(); b.disabled = true;
+      try {
+        const state = await send(path + "/refresh");
+        if (D.jid && bufferPath() === path) { D.buffer = state; drawClipDlg(false); }
         await tick();
       } finally { b.disabled = false; }
       return;

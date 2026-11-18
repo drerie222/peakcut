@@ -11,7 +11,7 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
-from . import creators, ctx
+from . import config, creators, ctx
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
       "Accept-Language": "en-US,en;q=0.9"}
@@ -25,6 +25,7 @@ _live: dict = {}          # channel link -> (when, result): everyone watching th
 _live_locks: dict = {}
 _live_retry: dict = {}    # channel -> (deadline, failed attempts)
 _platform_retry: dict = {}
+_next_probe = 0.0
 LIVE_SHARED_FOR = 75      # seconds a live check is reused for every user
 
 _cache: dict = {}
@@ -147,7 +148,7 @@ _TWITCH_WEB = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 def _twitch_live(login: str, off: dict) -> dict:
     import calendar
     import httpx
-    q = 'query($l:String!){user(login:$l){login stream{title viewersCount createdAt type}}}'
+    q = 'query($l:String!){user(login:$l){login stream{title viewersCount createdAt type game{name}}}}'
     r = httpx.post("https://gql.twitch.tv/gql", json={"query": q, "variables": {"l": login}},
                    headers={"Client-ID": _TWITCH_WEB, **UA}, timeout=8)
     r.raise_for_status()
@@ -166,6 +167,7 @@ def _twitch_live(login: str, off: dict) -> dict:
     except Exception:  # noqa: BLE001
         pass
     return {"live": True, "viewers": st.get("viewersCount"), "title": (st.get("title") or "")[:140], "started": started,
+            "category": (st.get("game") or {}).get("name") or "",
             "embed": (user.get("login") or login).lower()}
 
 
@@ -214,7 +216,8 @@ def live_now(platform: str, url: str) -> dict:
     if platform == "Kick":
         slug = path[0]
         _, raw = _get(f"https://kick.com/api/v2/channels/{slug}", "application/json")
-        ls = json.loads(raw).get("livestream")
+        channel = json.loads(raw)
+        ls = channel.get("livestream")
         if not ls:
             return off
         started = None
@@ -223,7 +226,10 @@ def live_now(platform: str, url: str) -> dict:
             started = calendar.timegm(time.strptime(ls.get("start_time") or ls.get("created_at"), "%Y-%m-%d %H:%M:%S"))
         except Exception:
             pass
-        return {"live": True, "viewers": ls.get("viewer_count"), "title": ls.get("session_title") or "", "started": started, "embed": slug}
+        categories = ls.get("categories") or ([ls["category"]] if ls.get("category") else channel.get("categories")) or []
+        category = next((c["name"] for c in categories if isinstance(c, dict) and c.get("name")), "")
+        return {"live": True, "viewers": ls.get("viewer_count"), "title": ls.get("session_title") or "",
+                "category": category, "started": started, "embed": slug}
     if platform == "YouTube":
         base = re.sub(r"/(live|videos|streams|featured)$", "", url)
         _, raw = _get(base + "/live")
@@ -275,7 +281,17 @@ def _retry_after(exc):
         return 0
 
 
-def live_shared(platform: str, url: str) -> dict:
+def _pace_probe():
+    global _next_probe
+    with _lock:
+        now = time.monotonic()
+        due = max(now, _next_probe)
+        _next_probe = due + config.WATCH_PROBE_GAP
+    if due > now:
+        time.sleep(due - now)
+
+
+def live_shared(platform: str, url: str, *, pace=False) -> dict:
     """live_now, asked at most once per channel every LIVE_SHARED_FOR seconds however many people follow it.
     If a thousand users have the same creator, the platform is asked once, not a thousand times."""
     key = url.rstrip("/").lower()
@@ -291,6 +307,10 @@ def live_shared(platform: str, url: str) -> dict:
             return {**(got[1] if got else {}), "error": "Platform rate limit. Waiting before checking again."}
         if now < until:
             return dict(got[1]) if got else {"error": "Could not check the channel. PeakCut will try again."}
+        if pace and config.WATCH_PROBE_GAP:
+            _pace_probe()
+            if time.time() < _platform_retry.get(platform, 0):
+                return {**(got[1] if got else {}), "error": "Platform rate limit. Waiting before checking again."}
         try:
             out = live_now(platform, url)
         except Exception as exc:

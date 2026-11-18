@@ -65,6 +65,8 @@ def _next_slot(account_id, gap_min, cap):
 
 
 def enqueue(job, clip, account_ids, now=False) -> list:
+    if config.DRAFT_ONLY:
+        return []
     c = creators.get(job["creator"]) or creators.DEFAULTS
     made = []
     with _lock:
@@ -267,9 +269,10 @@ def start():
             if p["status"] == "posting":  # interrupted mid-upload last time
                 p.update(status="failed", error="The studio closed during this upload. Check the account, then retry.")
         _save()
-    jobs.on_clip_ready.append(on_clip_ready)
-    threading.Thread(target=_run, daemon=True).start()
-    threading.Thread(target=_stats, daemon=True).start()
+    if not config.DRAFT_ONLY:
+        jobs.on_clip_ready.append(on_clip_ready)
+        threading.Thread(target=_run, daemon=True).start()
+        threading.Thread(target=_stats, daemon=True).start()
     threading.Thread(target=alerts.digest_loop, args=(digest_text,), daemon=True).start()
     threading.Thread(target=alerts.keep_awake_loop,
                      args=(lambda: bool(live.active()) or any(p["status"] in OPEN for p in _posts),), daemon=True).start()

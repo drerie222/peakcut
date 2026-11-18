@@ -66,7 +66,7 @@ class _Quiet:
 def resolve(url: str) -> dict:
     """Ask yt-dlp for the stream's playable address. Raises NotLive if the channel is offline."""
     import yt_dlp
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "logger": _Quiet(),
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "logger": _Quiet(), "socket_timeout": 15,
             "format": "b[height<=720]/bv*[height<=720]+ba/b"}
     if media.is_youtube(url) and media.youtube_paused():
         raise NotLive(media.YT_BLOCKED)
@@ -89,6 +89,12 @@ def resolve(url: str) -> dict:
 
 def active():
     return [s for s in list(SESSIONS.values()) if not s.finished and not s.user_stopped]
+
+
+def recording_count():
+    """A capture still occupies its slot while FFmpeg or its connection is winding down."""
+    return sum(getattr(s, "ingesting", False) or (not s.finished and not s.user_stopped)
+               for s in list(SESSIONS.values()))
 
 
 def active_mine():
@@ -117,6 +123,7 @@ class Session:
         self.stop_flag = threading.Event()
         self.ended = False            # recording has stopped (stream over, stopped, or failed)
         self.finished = False         # everything is wrapped up
+        self.ingesting = False
         self.end_note = "Stream ended"
         self.user_stopped = False     # Stop pressed: wrap up at once, no last AI check
         self.proc = None
@@ -217,6 +224,7 @@ class Session:
 
     # ---------------------------------------------------------------- recording
     def start(self):
+        self.ingesting = True
         SESSIONS[self.job["id"]] = self
         threading.Thread(target=ctx.bind(self._ingest), daemon=True).start()
         threading.Thread(target=ctx.bind(self._analyze), daemon=True).start()
@@ -227,16 +235,28 @@ class Session:
     def stop(self, note="Stopped by you"):
         """Instant for the user: the card and the creator show as stopped straight away. Clips already being made
         still finish in the background, but nothing new is transcribed or sent to the AI."""
-        self.end_note = note
-        self.user_stopped = True
-        self.stop_flag.set()
         with self.lock:
+            if self.user_stopped:
+                return
+            self.end_note = note
+            self.user_stopped = True
+            self.stop_flag.set()
+            self.manual.clear()
             if self.job.get("watch_broadcast") and note == "Stopped by you":
                 self.job["watch_stopped"] = True
             self.job.update(status="done", stage=note)
+            proc = self.proc
+            if proc and proc.poll() is None:
+                proc.terminate()
+                threading.Thread(target=self._force_stop, args=(proc,), daemon=True).start()
         jobs.save(self.job)
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+
+    @staticmethod
+    def _force_stop(proc):
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
     def _ingest(self):
         """Record the stream. However this ends, even when ffmpeg cannot start at all, the session is marked as
@@ -246,6 +266,7 @@ class Session:
         except Exception as e:  # noqa: BLE001
             self.job["error"] = f"Recording stopped: {media_safe(e)}"
         finally:
+            self.ingesting = False
             self.ended = True
 
     def _ingest_loop(self):
@@ -271,15 +292,18 @@ class Session:
             cmd = ["ffmpeg", "-v", "error", "-reconnect", "1", "-reconnect_streamed", "1",
                    "-reconnect_delay_max", "10"]
             for u in info["urls"]:
-                cmd += ["-i", u]
+                cmd += [*load.ffmpeg_threads(), "-i", u]
             a_in = "1:a:0" if len(info["urls"]) > 1 else "0:a:0"
             cmd += ["-map", "0:v:0", "-map", a_in, "-c", "copy", "-f", "segment", "-segment_time", str(SEG_SEC),
                     "-reset_timestamps", "1", "-segment_format", "mpegts", "-segment_list", f"{p}.csv",
                     "-segment_list_type", "csv", f"{p}_%05d.ts",
                     "-map", a_in, "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"]
             with open(self.dir / "ffmpeg.log", "ab") as errlog:
-                self.proc = subprocess.Popen(cmd, cwd=self.buf, stdout=subprocess.PIPE, stderr=errlog,
-                                             creationflags=media.NO_WINDOW)
+                with self.lock:
+                    if self.stop_flag.is_set():
+                        break
+                    self.proc = subprocess.Popen(cmd, cwd=self.buf, stdout=subprocess.PIPE, stderr=errlog,
+                                                 creationflags=media.NO_WINDOW)
                 got = 0
                 while True:
                     data = self.proc.stdout.read(SR * 2)  # one second of 16-bit mono
@@ -293,6 +317,14 @@ class Session:
                         self.pending += data
                         self.samples += len(data) // 2
                         self.db.append(level)
+                        overloaded = len(self.pending) > SR * 2 * config.LIVE_AUDIO_BACKLOG
+                    if load.render_disk_full():
+                        self.stop("Recording stopped because disk space is low")
+                        break
+                    if overloaded:
+                        self.job["error"] = "Recording paused because transcription fell behind."
+                        self.stop(self.job["error"])
+                        break
                 self.proc.wait()
             fails = 0 if got > SR * 2 * 20 else fails + 1
             if fails >= 3:
@@ -317,8 +349,16 @@ class Session:
                     self.seg_clock += dur
                 self.csv_seen[i] = len(rows)
             keep_from = self.seg_clock - self.settings["buffer_min"] * 60
-            while self.segments and self.segments[0][2] < keep_from:
-                self.segments.pop(0)[0].unlink(missing_ok=True)
+            spans = [(c["start"] - PAD, c["end"] + PAD) for c in self.job["clips"]
+                     if c.get("status") in ("queued", "rendering") and not c.get("src")]
+            keep = []
+            for part in self.segments:
+                path, a, b = part
+                if b >= keep_from or any(b > start and a < end for start, end in spans):
+                    keep.append(part)
+                else:
+                    path.unlink(missing_ok=True)
+            self.segments = keep
 
     # ---------------------------------------------------------------- chat (Twitch only)
     def _chat(self, channel):
@@ -392,9 +432,9 @@ class Session:
             hurry = self.ended or bool(self.manual)
             if n < (SR if hurry else SR * 7):   # about every 7 s, so "what was just said" really is live
                 return False
-            audio = np.frombuffer(bytes(self.pending[: n * 2]), dtype=np.int16)
+            audio = np.frombuffer(bytes(self.pending[: min(n, SR * 24) * 2]), dtype=np.int16)
             base = self.pending_base
-        cut = n
+        cut = len(audio)
         if not hurry or n > SR * 24:
             # cut at the quietest moment between 4 and 6.5 s, so no word is split; the rest waits for the next pass
             _, cut = next(transcribe._chunks(audio, 4.0, 6.5))
@@ -588,12 +628,15 @@ class Session:
             for i in range(len(key) - len(parts) + 1):
                 if key[i:i + len(parts)] == parts:
                     t = new_words[i]["s"]
-                    if t - self.last_trigger > 45:
-                        self.last_trigger = t
-                        self.manual.append({"start": max(0.0, t - 30), "end": t + 2, "why": f'Someone said "{p}"'})
+                    with self.lock:
+                        if not self.user_stopped and len(self.manual) < 3 and t - self.last_trigger > 45:
+                            self.last_trigger = t
+                            self.manual.append({"start": max(0.0, t - 30), "end": t + 2, "why": f'Someone said "{p}"'})
 
     def _manual_step(self):
-        for req in [m for m in self.manual if m["end"] <= self.t_done or self.ended]:
+        with self.lock:
+            ready = [m for m in self.manual if m["end"] <= self.t_done or self.ended]
+        for req in ready:
             text = " ".join(w["w"] for w in self.words if req["start"] <= w["s"] <= req["end"])
             usage.set_context(self.job["creator"], self.job["title"] or "Live stream")
             try:
@@ -604,7 +647,10 @@ class Session:
                 self.job["ai"]["last_error"] = str(e)[-200:]
                 c = {"score": 0, "category": "other", "hook": "", "title": self.job["title"],
                      "description": "", "hashtags": [], "highlight_words": []}
-            self.manual.remove(req)
+            with self.lock:
+                if self.user_stopped:
+                    return
+                self.manual.remove(req)
             c.update(start=round(req["start"], 2), end=round(min(req["end"], self.samples / SR), 2), score=0)
             if req.get("why"):
                 c["reason"] = req["why"]
@@ -627,6 +673,7 @@ class Session:
             if self.ended or (self.segments and self.segments[-1][2] >= clip["end"] + 1):
                 break
             time.sleep(1)
+        load.wait_for_disk()
         with self.lock:
             segs = [s for s in self.segments if s[2] > clip["start"] - PAD and s[1] < clip["end"] + PAD and s[0].exists()]
         if not segs or segs[0][1] > clip["start"] + 2:
@@ -640,8 +687,9 @@ class Session:
         lst.write_text("".join(f"file '{s[0].as_posix()}'\n" for s in segs), encoding="utf-8")
         src = self.dir / "clips" / f"{clip['id']}.src.ts"
         try:
-            media.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
-                       "-c", "copy", str(src)])
+            with load.heavy_work(writes_video=True):
+                media.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
+                           "-c", "copy", str(src)])
         except Exception as e:  # noqa: BLE001
             clip.update(status="error", error=media_safe(e))
             jobs.save(self.job)
@@ -669,11 +717,10 @@ class Session:
         clocks that drift apart, so transcribe the clip's own audio and line its words up with the live words.
         Local speech model only: no AI calls."""
         key = lambda w: re.sub(r"[^a-z0-9]", "", w.lower())
+        wav = src.with_suffix(".wav")
         try:
-            wav = src.with_suffix(".wav")
             media.extract_audio(src, wav)
             heard = transcribe.transcribe(media.load_audio(wav))
-            wav.unlink(missing_ok=True)
             with self.lock:
                 near = [w for w in self.words if guess - 15 <= w["s"] <= guess + dur + 15]
             diffs = []
@@ -688,13 +735,20 @@ class Session:
                 return float(np.median(diffs))
         except Exception:  # noqa: BLE001 - fall back to the piece clock
             pass
+        finally:
+            wav.unlink(missing_ok=True)
         return guess
 
     def clip_last(self, seconds):
         end = self.samples / SR
         if end < 5:
             raise ValueError("Nothing has been recorded yet.")
-        self.manual.append({"start": max(0.0, end - seconds), "end": end})
+        with self.lock:
+            if self.user_stopped or self.ended:
+                raise ValueError("This recording has stopped.")
+            if len(self.manual) >= 3:
+                raise ValueError("Wait for a pending clip before requesting another one.")
+            self.manual.append({"start": max(0.0, end - seconds), "end": end})
 
     def _publish(self):
         elapsed = self.samples / SR
@@ -720,17 +774,19 @@ class Session:
             busy = False
             try:
                 if not self.user_stopped and not self.ended:      # a recording cannot run for ever
-                    if self.job.get("watch_broadcast") and load.disk_full():
-                        self.stop("Watchlist recording stopped because disk space is low")
+                    if load.render_disk_full():
+                        self.stop("Recording stopped because disk space is low")
                     elif time.time() - self.started_at > config.MAX_LIVE_HOURS * 3600:
                         self.stop(f"Stopped after {config.MAX_LIVE_HOURS:g} hours, the longest one recording can run")
                 self._scan_segments()
-                busy = self._transcribe_step()
+                busy = not self.user_stopped and self._transcribe_step()
                 if not started and self.samples:
                     started = True
-                    self.job.update(status="live", stage="Recording")
+                    if not self.user_stopped:
+                        self.job.update(status="live", stage="Recording")
                     creators.log(cid, f"Recording started: {self.job['title']}")
-                self._manual_step()
+                if not self.user_stopped:
+                    self._manual_step()
                 # Three ways the AI is asked: on the creator's schedule (every N minutes), and always, when the
                 # stream suddenly gets louder or chat busier, or when someone says "clip".
                 every = int(self.settings.get("ai_every_min", 3)) or 3
@@ -775,6 +831,8 @@ class Session:
                           f"{round(self.samples / SR / 60)} min.")
 
         def cleanup():  # runs after any queued renders, then frees the buffer
+            while self.ingesting:
+                time.sleep(0.2)
             for f in self.buf.glob("*"):
                 f.unlink(missing_ok=True)
             self.finished = True
@@ -847,10 +905,12 @@ def _start_session(creator, url, watch, watch_limit):
     if len(active_mine()) >= config.MAX_LIVE_PER_USER:
         raise ValueError(f"You're already recording {len(active_mine())} streams, the most this server allows at once. Stop one first.")
     ceiling = config.MAX_LIVE_TOTAL if watch_limit is None else min(watch_limit, config.MAX_LIVE_TOTAL)
-    if len(active()) >= ceiling or (active() and load.busy()):
+    if recording_count() >= ceiling or (recording_count() and load.busy()):
         raise ValueError("PeakCut is recording as many streams as it can right now. Try again in a little while.")
-    if load.disk_full():
+    if load.render_disk_full():
         raise ValueError("There is not enough disk space to start recording.")
+    if config.LOW_RESOURCE and load.memory_low():
+        raise ValueError("There is not enough free memory to start recording yet.")
     from . import tools
     if tools.missing():
         raise ValueError(tools.HELP)
@@ -977,10 +1037,10 @@ def _resume_recordings(paused):
 
 def start():
     paused = []
+    recovering = []
     for j in jobs.all_jobs():
         if j.get("recover"):
-            with ctx.as_user(j["user"]):
-                recover(j)
+            recovering.append(j)
         if j.get("was_live") and j.get("creator"):
             if not j.get("watch_broadcast"):
                 paused.append((j["user"], j["creator"], j["source"]["url"]))
@@ -988,4 +1048,18 @@ def start():
             jobs.save(j)
     if paused:
         threading.Thread(target=_resume_recordings, args=(paused,), daemon=True).start()
+    def recover_all():
+        for job in recovering:
+            with ctx.as_user(job["user"]):
+                try:
+                    recover(job)
+                except Exception:  # noqa: BLE001 - an unusable buffer must not hold up another recording
+                    job.pop("recover", None)
+                    job.update(status="error", stage="Could not recover the recording")
+                    for clip in job["clips"]:
+                        if clip.get("status") == "queued":
+                            clip.update(status="error", error="Could not recover this clip from the recording.")
+                    jobs.save(job)
+    if recovering:
+        threading.Thread(target=recover_all, daemon=True, name="live-recovery").start()
     threading.Thread(target=watch_loop, daemon=True).start()

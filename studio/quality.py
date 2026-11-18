@@ -21,7 +21,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from . import config
+from . import config, load
 
 _FFMPEG = "ffmpeg"
 
@@ -29,6 +29,7 @@ _PTS = re.compile(r"pts_time:([0-9.]+)")
 _YAVG = re.compile(r"lavfi\.signalstats\.YAVG=([0-9.]+)")
 
 
+@load.serial_work
 def motion_map(path: str | Path, bucket: float = 2.0) -> list[tuple[float, float]]:
     """(time, motion) for every bucket of the video, or nothing if it cannot be read.
 
@@ -36,7 +37,7 @@ def motion_map(path: str | Path, bucket: float = 2.0) -> list[tuple[float, float
     frozen screen, high for anything actually moving."""
     try:
         proc = subprocess.run(
-            [_FFMPEG, "-hide_banner", "-loglevel", "error",
+            [_FFMPEG, "-hide_banner", "-loglevel", "error", *load.ffmpeg_threads(),
              "-i", str(path),
              "-vf", "tblend=all_mode=difference,signalstats,metadata=print:file=-",
              "-an", "-f", "null", "-"],

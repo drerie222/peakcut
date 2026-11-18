@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from . import config, roman
+from . import config, load, roman
 from .media import NO_WINDOW, run
 
 W, H = config.OUT_W, config.OUT_H
@@ -281,7 +281,8 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     # break the filter syntax).
     work = Path(tempfile.mkdtemp(prefix="pk"))
     try:
-        return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass, face=face)
+        with load.heavy_work(writes_video=True):
+            return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass, face=face)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -293,11 +294,13 @@ def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layo
     for f in config.FONTS_DIR.glob("*.ttf"):
         shutil.copyfile(f, work / "f" / f.name)
     fc = _filter(layout, fg_h, face) + f"[v0]ass={name}.ass:fontsdir=f[v]"
-    base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", "-i", str(src),
+    threads = load.ffmpeg_threads()
+    filters = ["-filter_threads", str(config.FFMPEG_THREADS), "-filter_complex_threads", str(config.FFMPEG_THREADS)] if threads else []
+    base = ["ffmpeg", "-y", "-v", "error", *filters, "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", *threads, "-i", str(src),
             "-filter_complex", fc, "-map", "[v]", "-map", "0:a:0", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
-            "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-movflags", "+faststart", "-pix_fmt"]
+            "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-movflags", "+faststart", *threads, "-pix_fmt"]
     encoders = []
-    if _qsv_ok is not False:
+    if not config.LOW_RESOURCE and _qsv_ok is not False:
         encoders.append(("qsv", ["nv12", "-c:v", "h264_qsv", "-global_quality", "23", "-preset", "fast"]))
     encoders.append(("x264", ["yuv420p", "-c:v", "libx264", "-crf", "21", "-preset", "veryfast"]))
     err = None
@@ -314,7 +317,7 @@ def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layo
     else:
         raise RuntimeError(f"Render failed: {err}")
     cover_t = min(1.2, (end - start) / 2)
-    run(["ffmpeg", "-y", "-v", "error", "-ss", f"{cover_t:.2f}", "-i", f"{name}.mp4", "-frames:v", "1",
+    run(["ffmpeg", "-y", "-v", "error", "-ss", f"{cover_t:.2f}", *threads, "-i", f"{name}.mp4", "-frames:v", "1",
          "-q:v", "3", f"{name}.jpg"], cwd=work)
     for ext in ("mp4", "jpg", "ass"):
         shutil.move(str(work / f"{name}.{ext}"), str(out_dir / f"{name}.{ext}"))

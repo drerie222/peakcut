@@ -74,6 +74,8 @@ def _startup():
     jobs.start()
     discord_clips.start()
     live.start()
+    from . import storage
+    storage.start()
     posting.start()
     from . import updates
     updates.start()                  # looks for a newer PeakCut every minute, in the background
@@ -453,6 +455,8 @@ def _signed_in(request: Request, user, first: bool, redirect=None):
 
 @app.post("/api/auth/signup")
 def signup(request: Request, body: dict = Body(...)):
+    if not config.ALLOW_SIGNUP:
+        raise HTTPException(403, "Sign-up is closed. Ask the server administrator for an account.")
     try:
         auth.throttle("signup:" + _ip(request), 8, 3600)
         user, first = auth.signup(str(body.get("email", "")), str(body.get("password", "")), str(body.get("name", "")))
@@ -579,6 +583,7 @@ def status(request: Request):
     me_ = _me(request)
     return {"user": auth.public(me_), "update": updates.latest() if me_.is_admin else None, "accounts": config.ACCOUNTS, "disk_full": load.disk_full(), "no_ffmpeg": bool(_tools.missing()), "links": {"repo": config.REPO_URL, "follow": config.FOLLOW_URL}, "ai": usage.brief(), "unread": notices.unread(),
             "tour": not accounts.settings()["tour_done"], "buffer_drafts": bool(me_.is_admin and buffer.configured()),
+            "draft_only": config.DRAFT_ONLY,
             "watchlist": {"limit": watchlist.recording_limit(), "ceiling": min(30, config.MAX_LIVE_TOTAL, config.MAX_LIVE_PER_USER),
                           "buffer": bool(me_.is_admin and accounts.settings()["watch_buffer"])},
             "youtube": accounts.youtube_ready(), "connect": {p: accounts.can_connect(p) for p in accounts.PLATFORM_NAMES}, "max_upload_mb": config.MAX_UPLOAD_MB, "upload_part_mb": config.UPLOAD_PART_MB, "max_batch": config.MAX_ACTIVE_JOBS_PER_USER,
@@ -599,6 +604,8 @@ def _job_slots():
         raise HTTPException(503, tools.HELP)
     if jobs.busy_count() >= config.MAX_ACTIVE_JOBS_PER_USER:
         raise HTTPException(429, f"You already have {config.MAX_ACTIVE_JOBS_PER_USER} videos in progress. Wait for one to finish.")
+    if jobs.waiting_total() >= config.MAX_QUEUED_VIDEOS:
+        raise HTTPException(429, "The video queue is full. Try again when a video starts.")
 
 
 _create_lock = threading.Lock()      # "do I have a free slot?" and "take it" happen together, so bursts cannot slip past the limit
@@ -676,8 +683,12 @@ def sync(v: str = ""):
     if v == token:
         return _sync_unchanged(v) or {"v": token}
     from . import notices
-    return {"v": token, "jobs": [jobs.public(j) for j in jobs.list_jobs()], "creators": _creator_rows(),
-            "accounts": accounts.list_accounts(), "ai": usage.brief(), "unread": notices.unread()}
+    payload = {"v": token, "jobs": [jobs.public(j) for j in jobs.list_jobs()], "creators": _creator_rows(),
+               "accounts": accounts.list_accounts(), "ai": usage.brief(), "unread": notices.unread()}
+    decisions = watchlist.decisions()
+    if decisions:
+        payload["watch_decisions"] = decisions
+    return payload
 
 
 @app.get("/api/jobs")
@@ -943,6 +954,8 @@ def rerender(jid: str, cid: str, body: dict = Body(...)):
     _throttle("render:" + ctx.uid(), 20, 600, "That's a lot of re-makes in a short time. Wait a few minutes.")
     try:
         jobs.request_render(jid, cid, body)
+    except jobs.RenderQueueFull as e:
+        raise HTTPException(429, str(e))
     except (ValueError, TypeError) as e:
         raise HTTPException(400, str(e))
     return jobs.public(job)
@@ -1486,6 +1499,8 @@ def apps_put(request: Request, body: dict = Body(...)):
 
 @app.post("/api/posts")
 def add_posts(body: dict = Body(...)):
+    if config.DRAFT_ONLY:
+        raise HTTPException(403, "This server only prepares drafts for review in Buffer.")
     job = jobs.get(str(body.get("job")))
     clip = next((c for c in job["clips"] if c["id"] == body.get("clip")), None) if job else None
     if not clip or clip.get("status") != "done":
@@ -1532,6 +1547,19 @@ def revoke_buffer_link(request: Request, jid: str, cid: str):
     _, clip = _buffer_clip(request, jid, cid)
     buffer.revoke(jid, cid)
     ctx.bump()
+    return buffer.status(jid, clip)
+
+
+@app.post("/api/admin/jobs/{jid}/clips/{cid}/buffer-draft/refresh")
+def refresh_buffer_status(request: Request, jid: str, cid: str):
+    job, clip = _buffer_clip(request, jid, cid)
+    _throttle("buffer-status:" + ctx.uid(), 6, 60)
+    try:
+        buffer.refresh_publication(jid, clip)
+    except buffer.Error as exc:
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+        raise HTTPException(exc.status, str(exc), headers=headers) from None
+    jobs.save(job)
     return buffer.status(jid, clip)
 
 

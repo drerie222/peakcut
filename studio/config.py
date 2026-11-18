@@ -163,6 +163,8 @@ DISCORD_STATUS_WEBHOOK_URL = env("DISCORD_STATUS_WEBHOOK_URL", "").strip()
 # on your own computer. On a server that other people can reach, set PEAKCUT_ACCOUNTS=1: everyone then signs up
 # and signs in, and each person only sees their own videos.
 ACCOUNTS = env("PEAKCUT_ACCOUNTS", "0") == "1"
+ALLOW_SIGNUP = env("PEAKCUT_ALLOW_SIGNUP", "1") == "1"
+DRAFT_ONLY = env("PEAKCUT_DRAFT_ONLY", "0") == "1"
 
 
 def buffer_api_key() -> str:
@@ -190,9 +192,22 @@ MAX_UPLOAD_MB = int(_limit("PEAKCUT_MAX_UPLOAD_MB"))              # the largest 
 # refuse very large single requests (Cloudflare stops at 100 MB).
 UPLOAD_PART_MB = max(5, int(env("PEAKCUT_UPLOAD_PART_MB", "40")))
 # The most videos that may ever run at once. How many actually run is decided by how busy the machine is (load.py).
-JOB_WORKERS = int(env("PEAKCUT_JOB_WORKERS") or max(2, os.cpu_count() or 4))
+LOW_RESOURCE = env("PEAKCUT_LOW_RESOURCE", "1") == "1"
+JOB_WORKERS = int(env("PEAKCUT_JOB_WORKERS") or (1 if LOW_RESOURCE else max(2, os.cpu_count() or 4)))
 MAX_ACTIVE_JOBS_PER_USER = int(_limit("PEAKCUT_MAX_JOBS_PER_USER", "5"))    # videos sent and worked on at once
-MAX_LIVE_TOTAL = int(env("PEAKCUT_MAX_LIVE") or "3")                 # ceiling; real load decides below it
+MAX_QUEUED_VIDEOS = max(1, int(env("PEAKCUT_MAX_QUEUED_VIDEOS", "8")))
+MAX_QUEUED_RENDERS = max(1, int(env("PEAKCUT_MAX_QUEUED_RENDERS", "4")))
+MAX_LIVE_TOTAL = int(env("PEAKCUT_MAX_LIVE") or ("1" if LOW_RESOURCE else "3"))
+LIVE_AUDIO_BACKLOG = max(30, int(env("PEAKCUT_LIVE_AUDIO_BACKLOG_SEC", "120")))
+RAW_RETENTION_HOURS = max(0., float(env("PEAKCUT_RAW_RETENTION_HOURS", "0")))
+WATCH_PROBE_GAP = max(0., float(env("PEAKCUT_WATCH_PROBE_GAP_SEC", "2")))
+WATCH_MIN_SEC = max(0, int(env("PEAKCUT_WATCH_MIN_MINUTES", "20"))) * 60
+WATCH_MAX_SEC = max(WATCH_MIN_SEC, max(1, int(env("PEAKCUT_WATCH_MAX_MINUTES", "60"))) * 60)
+WATCH_COOLDOWN_SEC = max(0, int(env("PEAKCUT_WATCH_SWITCH_COOLDOWN_MINUTES", "10"))) * 60
+WATCH_SWITCH_MARGIN = max(1, int(env("PEAKCUT_WATCH_SWITCH_MARGIN", "25")))
+WATCH_FAIR_WAIT_SEC = max(1, int(env("PEAKCUT_WATCH_FAIR_WAIT_MINUTES", "180"))) * 60
+WATCH_GTA_CATEGORY_POINTS = max(0, int(env("PEAKCUT_WATCH_GTA_CATEGORY_POINTS", "30")))
+WATCH_GTA_TITLE_POINTS = max(0, int(env("PEAKCUT_WATCH_GTA_TITLE_POINTS", "10")))
 MAX_LIVE_PER_USER = int(_limit("PEAKCUT_MAX_LIVE_PER_USER"))     # streams one person records at once
 MAX_VIDEO_HOURS = _limit("PEAKCUT_MAX_VIDEO_HOURS")              # longest video (or chosen part of one) that is processed
 MAX_LIVE_HOURS = _limit("PEAKCUT_MAX_LIVE_HOURS")                # a recording stops by itself after this long
@@ -255,4 +270,5 @@ def _read_google_client() -> tuple:
 
 # ---------------------------------------------------------------- video
 MAX_SOURCE_HEIGHT = 1080
-OUT_W, OUT_H, OUT_FPS = 1080, 1920, 30
+OUT_W, OUT_H, OUT_FPS = 1080, 1920, max(1, min(60, int(env("PEAKCUT_OUT_FPS", "30"))))
+FFMPEG_THREADS = max(1, int(env("PEAKCUT_FFMPEG_THREADS", "1")))

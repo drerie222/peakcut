@@ -7,8 +7,10 @@ and the next time PeakCut starts it moves what is there and carries on from the 
 is moved while PeakCut is running, when files are open)."""
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -149,3 +151,88 @@ def cancel_change():
             config.STORAGE_FILE.write_text(json.dumps({"path": str(config.DATA_DIR.resolve())}, indent=1), encoding="utf-8")
         else:
             config.STORAGE_FILE.unlink(missing_ok=True)
+
+
+def prune_recordings(now=None):
+    """Expire only PeakCut's own raw live files. The MP4, cover, transcript and draft link stay."""
+    from . import ctx, jobs, live
+
+    if not config.RAW_RETENTION_HOURS:
+        return 0
+    cutoff = (time.time() if now is None else now) - config.RAW_RETENTION_HOURS * 3600
+    removed = 0
+
+    def expire(path, directory):
+        if path.parent != directory or directory.is_symlink() or path.is_symlink():
+            return False
+        try:
+            if path.is_file() and path.stat().st_mtime <= cutoff:
+                path.unlink()
+                return True
+        except OSError:
+            pass
+        return False
+
+    for job in jobs.all_jobs():
+        if job["kind"] != "live":
+            continue
+        with jobs._lock:
+            if (jobs._jobs.get(job["id"]) is not job or job["id"] in live.SESSIONS or job.get("recover")
+                    or job["status"] not in ("done", "error")
+                    or any(c.get("status") in ("queued", "rendering") for c in job["clips"])):
+                continue
+            folder = Path(job["dir"])
+            if not folder.resolve().is_relative_to(config.USERS_DIR.resolve()) or folder.is_symlink():
+                continue
+            changed = False
+            for clip in job["clips"]:
+                if not re.fullmatch(r"[\w-]+", clip["id"]):
+                    continue
+                path = folder / "clips" / f"{clip['id']}.src.ts"
+                if clip.get("src") == str(path) and expire(path, folder / "clips"):
+                    clip["raw_expired"] = changed = True
+                    removed += 1
+            for path in (folder / "buffer").glob("p*"):
+                if re.fullmatch(r"p\d+(?:_\d+\.ts|\.csv)", path.name):
+                    removed += expire(path, folder / "buffer")
+            if changed:
+                with ctx.as_user(job["user"]):
+                    jobs.save(job)
+    if removed:
+        _used["at"] = 0
+    return removed
+
+
+def _warn_disk():
+    from . import auth, ctx, discord_clips
+
+    for uid in auth.user_ids():
+        owner = auth.get_user(uid)
+        if owner and owner.is_admin:
+            with ctx.as_user(uid):
+                day = time.strftime("%Y-%m-%d")
+                discord_clips.event("status", f"disk:{day}",
+                                    "Free disk space is below the reserve. Recording and new renders are paused.")
+            return
+
+
+def start():
+    """Keep raw-file maintenance independent of a render waiting for storage."""
+    def maintain():
+        sweep_at = 0
+        warned = False
+        while True:
+            try:
+                full = load.render_disk_full()
+                if time.time() >= sweep_at or (full and not warned):
+                    prune_recordings()
+                    sweep_at = time.time() + (300 if full else 3600)
+                if full and not warned:
+                    _warn_disk()
+                warned = full
+            except Exception:  # noqa: BLE001 - retry next time, without logging private file paths
+                import logging
+                logging.getLogger(__name__).warning("Could not check the recording retention policy.")
+            time.sleep(30)
+
+    threading.Thread(target=maintain, daemon=True, name="recording-retention").start()

@@ -19,7 +19,7 @@ import threading
 
 import httpx
 
-from . import config
+from . import config, load
 
 # name -> (label shown on the pages, address, how it is spoken to, where to get a key, an example model id)
 PROVIDERS = {
@@ -292,6 +292,7 @@ def _parse(text):
 
 
 # ---------------------------------------------------------------- one call
+@load.serial_ai
 def call(model: str, prompt: str, schema: dict, timeout: float | None = None):
     """Ask one model. Returns (the parsed JSON answer, tokens sent, tokens written back).
 
@@ -301,6 +302,7 @@ def call(model: str, prompt: str, schema: dict, timeout: float | None = None):
     return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how](model, prompt, schema, timeout)
 
 
+@load.serial_ai
 def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, int, int]:
     """Ask one model about one picture: (the answer as text, tokens in, tokens out).
 

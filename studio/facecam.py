@@ -31,6 +31,8 @@ from pathlib import Path
 
 import numpy as np
 
+from . import load
+
 W, H = 320, 180            # the picture is looked at small: only the lines matter
 MAX_FRAMES = 24            # frames spread through the video
 MIN_SIZE = 0.12            # the smallest a webcam may be, as a part of the width or height
@@ -45,6 +47,7 @@ MATCH = 0.35               # how much a box the AI points at must cover a measur
 EDGE = 2.2                 # how much brighter than the average line a border must be
 
 
+@load.serial_work
 def _frames(path: str | Path, count: int = MAX_FRAMES) -> np.ndarray:
     """The video as a few grey frames, spread through it."""
     try:
@@ -215,6 +218,7 @@ def _overlap(a, box) -> float:
     return inter / union if union > 0 else 0.0
 
 
+@load.serial_work
 def _full_frame(path: str | Path) -> np.ndarray | None:
     """One grey frame at full size, from the middle of the video: where the borders are measured."""
     w, h = _size(path)
@@ -301,6 +305,7 @@ def _finish(path: str | Path, found: dict, w: int, h: int, still: np.ndarray) ->
             "corner": _corner(x0, y0, x1, y1, w, h), "score": found.get("score", 0.0), "conf": conf}
 
 
+@load.serial_work
 def _frame_jpeg(path: str | Path, width: int = 768, at=None) -> bytes:
     """One frame of the stream, small, as a JPEG: what a model is shown."""
     try:

@@ -10,7 +10,7 @@ import time
 
 import numpy as np
 
-from . import config
+from . import config, load
 
 _lock = threading.Lock()
 
@@ -19,8 +19,9 @@ _lock = threading.Lock()
 # machine (under 8 cores) this is still a single copy, as before.
 _CPUS = os.cpu_count() or 4
 PROVIDER = os.environ.get("PEAKCUT_ASR_PROVIDER", "cpu").strip().lower() or "cpu"      # "cuda" on a graphics card
-THREADS = int(os.environ.get("PEAKCUT_ASR_THREADS") or (4 if _CPUS >= 8 else max(2, _CPUS - 2)))
-COPIES = int(os.environ.get("PEAKCUT_ASR_COPIES") or (1 if PROVIDER != "cpu" else max(1, _CPUS // THREADS) if _CPUS >= 8 else 1))
+THREADS = int(os.environ.get("PEAKCUT_ASR_THREADS") or (1 if config.LOW_RESOURCE else 4 if _CPUS >= 8 else max(2, _CPUS - 2)))
+COPIES = int(os.environ.get("PEAKCUT_ASR_COPIES") or
+             (max(1, _CPUS // THREADS) if not config.LOW_RESOURCE and PROVIDER == "cpu" and _CPUS >= 8 else 1))
 _free: "queue.LifoQueue" = queue.LifoQueue()
 _made = 0
 
@@ -273,6 +274,7 @@ def _decode_remote(pieces: list) -> list:
     return [(p["tokens"], p["timestamps"]) for p in got]
 
 
+@load.serial_work
 def transcribe(audio: np.ndarray, on_progress=None) -> list:
     """Returns [{'w': word, 's': start_sec, 'e': end_sec}, ...] for the whole audio.
     Speech is cut at quiet moments into 12-24 s pieces; silent pieces are skipped."""
