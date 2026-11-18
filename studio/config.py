@@ -156,6 +156,9 @@ PUBLIC_URL = (env("PEAKCUT_PUBLIC_URL") or f"http://127.0.0.1:{PORT}").rstrip("/
 HTTPS = PUBLIC_URL.startswith("https://")
 SESSION_DAYS = int(env("PEAKCUT_SESSION_DAYS", "30"))
 BUFFER_TIKTOK_CHANNEL_ID = env("BUFFER_TIKTOK_CHANNEL_ID", "").strip()
+DISCORD_CLIPS_WEBHOOK_URL = env("DISCORD_CLIPS_WEBHOOK_URL", "").strip()
+DISCORD_LIVE_WEBHOOK_URL = env("DISCORD_LIVE_WEBHOOK_URL", "").strip()
+DISCORD_STATUS_WEBHOOK_URL = env("DISCORD_STATUS_WEBHOOK_URL", "").strip()
 # Accounts are off by default: PeakCut opens straight into the dashboard, with no sign-in, which is what you want
 # on your own computer. On a server that other people can reach, set PEAKCUT_ACCOUNTS=1: everyone then signs up
 # and signs in, and each person only sees their own videos.
@@ -189,7 +192,7 @@ UPLOAD_PART_MB = max(5, int(env("PEAKCUT_UPLOAD_PART_MB", "40")))
 # The most videos that may ever run at once. How many actually run is decided by how busy the machine is (load.py).
 JOB_WORKERS = int(env("PEAKCUT_JOB_WORKERS") or max(2, os.cpu_count() or 4))
 MAX_ACTIVE_JOBS_PER_USER = int(_limit("PEAKCUT_MAX_JOBS_PER_USER", "5"))    # videos sent and worked on at once
-MAX_LIVE_TOTAL = int(env("PEAKCUT_MAX_LIVE") or max(4, 2 * (os.cpu_count() or 4)))   # ceiling; real load decides below it
+MAX_LIVE_TOTAL = int(env("PEAKCUT_MAX_LIVE") or "3")                 # ceiling; real load decides below it
 MAX_LIVE_PER_USER = int(_limit("PEAKCUT_MAX_LIVE_PER_USER"))     # streams one person records at once
 MAX_VIDEO_HOURS = _limit("PEAKCUT_MAX_VIDEO_HOURS")              # longest video (or chosen part of one) that is processed
 MAX_LIVE_HOURS = _limit("PEAKCUT_MAX_LIVE_HOURS")                # a recording stops by itself after this long

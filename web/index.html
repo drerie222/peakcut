@@ -809,6 +809,7 @@ dialog[open]{animation:fadein .16s ease}
   table.stack td.c-main::before,table.stack td.c-act::before,table.stack td:empty{display:none}
   table.stack td.c-act{grid-column:1/-1}
   .lc-acts{flex-wrap:wrap}.stream{padding:8px;gap:10px}
+  #watch-settings .btn, #watch-rows .btn { min-height:44px; }
   .set-sec h2{font-size:16px}
   .ai-big{font-size:24px}
 }
@@ -1248,7 +1249,7 @@ function moveInd() {
   lastInd = {x, w};
 }
 function drawShell() {  const nav = (v, icon, label, extra = "") => `<button class="nav-item ${S.view === v ? "on" : ""}" data-act="go" data-v="${esc(v)}" title="${esc(label)}">${icon}<span class="label">${esc(label)}</span>${extra}</button>`;
-  put($("#nav"), nav("overview", navIc("home", "overview"), "Home") +
+  put($("#nav"), nav("overview", navIc("home", "overview"), "Home") + nav("watchlist", ic("radio"), "Watchlist") +
     nav("library", navIc("film", "library"), "All videos", (() => { const w = S.jobs.filter(j => ["queued", "running"].includes(j.status)).length;
       return w ? `<span class="working" title="${w} working now"><i></i>${w} working</span>` : S.jobs.length ? `<span class="count">${S.jobs.length}</span>` : ""; })()) +
     `<h4><span>Creators</span></h4>` +
@@ -1266,7 +1267,7 @@ function drawShell() {  const nav = (v, icon, label, extra = "") => `<button cla
       <button class="icon-btn bell" data-act="bell" title="Notifications" aria-label="Notifications${S.status.unread ? `, ${S.status.unread} new` : ""}" aria-haspopup="dialog">${ic("bell")}${S.status.unread ? `<span class="dotn">${S.status.unread > 9 ? "9+" : S.status.unread}</span>` : ""}</button></div>` : ""));
   const c = creator();
   const recording = S.creators.filter(x => x.live_job).length;
-  let title = {overview:"Home", library:"All videos", settings:"Settings", usage:"AI usage"}[S.view] || "", sub = "", act = "";
+  let title = {overview:"Home", library:"All videos", settings:"Settings", usage:"AI usage", watchlist:"Watchlist"}[S.view] || "", sub = "", act = "";
   if (S.view === "usage") sub = "What the AI has been used for.";
   if (S.view === "overview") sub = `${greeting()}. ${S.creators.length} creator${S.creators.length === 1 ? "" : "s"}${recording ? `, ${recording} recording now` : ""}.`;
   if (S.view === "library") sub = "Every video and recording, across all creators.";
@@ -1304,7 +1305,7 @@ function drawShell() {  const nav = (v, icon, label, extra = "") => `<button cla
   put($("#title"), `<span>${esc(title)}</span>`); put($("#subtitle"), subHtml ?? esc(sub)); put($("#actions"), act);
 }
 
-const ROUTES = {overview: "", library: "videos", settings: "settings", usage: "usage"};
+const ROUTES = {overview: "", library: "videos", settings: "settings", usage: "usage", watchlist: "watchlist"};
 function pathFor(v, tab) {
   if (v.startsWith("c:")) return `/app/creators/${encodeURIComponent(v.slice(2))}${tab && tab !== "clips" ? "/" + tab : ""}`;
   if (v === "settings") return "/app/settings" + (tab ? "/" + tab : "");
@@ -1335,6 +1336,7 @@ function go(v, tab, fromHistory) {
   $("#heroSlot").innerHTML = v === "overview" ? `<section class="hero"><div class="ga-bg" id="appAscii" aria-hidden="true"></div><h2>What do you want to clip today?</h2>
       <p>Paste a link or drop in videos. You get captioned shorts back.</p><div id="add"></div></section>` : "";
   if (v === "overview") view.innerHTML = `<div id="ov"></div>`;
+  else if (v === "watchlist") view.innerHTML = `<div id="watch-settings"></div><div id="watch-rows"></div>`;
   else if (v === "library") view.innerHTML = `<div id="add"></div><div id="jobs"></div>`;
   else if (v === "settings") view.innerHTML = `<div id="sform"></div>`;
   else if (v === "usage") { view.innerHTML = `<div id="usage"></div>`; loadUsage(); }
@@ -2197,9 +2199,53 @@ $("#clipdlg").addEventListener("close", () => { $("#clipdlg").innerHTML = ""; D.
 $("#clipdlg").addEventListener("click", e => { if (e.target === e.currentTarget) e.currentTarget.close(); });
 
 /* ============================================================ render + polling */
+function drawWatchlist() {
+  const rows = S.creators.filter(c => c.watchlist).sort((a, b) => a.watchlist.order - b.watchlist.order);
+  const settings = S.status.watchlist || {limit:3, ceiling:3};
+  const byCreator = new Map();
+  for (const job of S.jobs) {
+    if (!job.watch_broadcast) continue;
+    if (!byCreator.has(job.creator)) byCreator.set(job.creator, []);
+    byCreator.get(job.creator).push(job);
+  }
+  put($("#watch-settings"), `<div class="card"><div class="card-head"><div><h2>Gaming channels</h2>
+    <p class="sub">${rows.length} of 30 added · ${rows.filter(c => c.auto_watch).length} enabled</p></div>
+    ${rows.length < 30 ? '<button class="btn" data-act="watch-import">Import 30 streamers</button>' : ""}</div>
+    ${S.status.user?.is_admin ? `<div class="fields">
+      <label class="f">Simultaneous recordings<input id="watch-limit" type="number" min="1" max="${settings.ceiling}" value="${settings.limit}" ${settings.ceiling === 0 ? "disabled" : ""}></label>
+      <label class="sw"><input type="checkbox" id="watch-buffer" ${settings.buffer ? "checked" : ""}> Save TikTok drafts in Buffer</label>
+      <div><button class="btn" data-act="watch-save">Save watchlist settings</button></div>
+      ${settings.buffer && !S.status.buffer_drafts ? '<p class="help">Set up Buffer on the server before exports can run.</p>' : ""}
+      </div>` : ""}</div>`);
+  put($("#watch-rows"), rows.length ? `<div class="card scroll"><table class="stack">
+    <tr><th>Streamer</th><th>Stream</th><th>Highlights and clips</th><th></th></tr>
+    ${rows.map(c => {
+      const s = c.watch_status || {}, js = byCreator.get(c.id) || [], clips = js.flatMap(j => j.clips || []);
+      const lastError = c.auto_watch && s.error || clips.find(k => k.error || k.watch_export?.error)?.error
+        || clips.find(k => k.watch_export?.error)?.watch_export.error || js.find(j => j.error)?.error;
+      const active = c.live_job ? "Recording" : !c.auto_watch ? "Disabled"
+        : ({live:"Live",offline:"Offline",unknown:"Check delayed"})[s.state] || "Awaiting check";
+      const done = clips.filter(k => k.status === "done").length;
+      const processing = clips.filter(k => ["queued","rendering"].includes(k.status)).length;
+      const drafts = clips.filter(k => k.watch_export?.state === "draft").length;
+      const exports = clips.filter(k => k.watch_export?.state === "queued").length;
+      return `<tr><td class="c-main" data-l="Streamer"><button class="lnk" data-act="go" data-v="c:${esc(c.id)}">${esc(c.name)}</button>
+        <span class="sub">Priority ${esc(c.watchlist.priority)}</span></td>
+        <td data-l="Stream"><span>${esc(active)} · ${esc(s.platform || Object.keys(c.channels)[0] || "No channel")}</span>
+        ${c.auto_watch && s.title ? `<span class="sub">${esc(s.title)}</span>` : ""}</td>
+        <td data-l="Highlights and clips"><span>${clips.filter(k => k.score > 0).length} highlights · ${done} ready · ${processing} processing</span>
+        ${drafts || exports ? `<span class="sub">${drafts} Buffer drafts · ${exports} waiting</span>` : ""}
+        ${lastError ? `<span class="err">${esc(lastError)}</span>` : ""}</td>
+        <td class="c-act"><div class="row"><button class="btn sm" data-act="watch-toggle" data-c="${esc(c.id)}"
+          aria-label="${c.auto_watch ? "Disable" : "Enable"} ${esc(c.name)}">${c.auto_watch ? "Disable" : "Enable"}</button>
+          <button class="btn sm" data-act="go" data-v="c:${esc(c.id)}" data-tab="setup" aria-label="Edit ${esc(c.name)}">Edit</button></div></td></tr>`;
+    }).join("")}</table></div>` : "");
+}
+
 function render() {
   drawShell(); drawJobs(); drawStream(); drawSelBar();
   if (S.view === "overview") drawOverview();
+  if (S.view === "watchlist") drawWatchlist();
   if ($("#clog")) drawLog();
   if (D.jid) drawClipDlg(false);
 }
@@ -2491,6 +2537,25 @@ document.addEventListener("click", async e => {
         body[i.dataset.f] = i.type === "checkbox" ? i.checked : i.type === "number" ? Number(i.value) : i.value;
       });
       await send(`/api/jobs/${D.jid}/clips/${D.cid}/render`, body); toast("Re-making the clip…", "ok"); return tick();
+    }
+    if (a === "watch-import" || a === "watch-toggle" || a === "watch-save") {
+      b.disabled = true;
+      try {
+        if (a === "watch-import") {
+          const result = await send("/api/watchlist/import");
+          toast(result.added ? `${result.added} streamers added` : "Watchlist is up to date", "ok");
+        } else if (a === "watch-toggle") {
+          const c = S.creators.find(x => x.id === d.c);
+          if (c) await send(`/api/creators/${encodeURIComponent(c.id)}`, {auto_watch:!c.auto_watch}, "PUT");
+        } else {
+          S.status.watchlist = await send("/api/admin/watchlist",
+            {watch_recordings:Number($("#watch-limit").value), watch_buffer:$("#watch-buffer").checked}, "PUT");
+          drawWatchlist();
+          toast("Watchlist settings saved", "ok");
+        }
+        await tick();
+      } finally { b.disabled = false; }
+      return;
     }
     if (a === "buffer-save" || a === "buffer-revoke") {
       const path = bufferPath(), save = a === "buffer-save";

@@ -24,7 +24,7 @@ _states: dict = {}   # one-time values for the connect redirects: state -> (user
 
 SECRET_KEYS = ("discord_webhook", "telegram_token")
 SETTING_DEFAULTS = {"discord_webhook": "", "telegram_token": "", "telegram_chat": "", "paused": False,
-                    "digest_hour": 8, "last_digest": "", "tour_done": False}
+                    "digest_hour": 8, "last_digest": "", "tour_done": False, "watch_recordings": 3, "watch_buffer": False}
 
 YT_SCOPES = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
 IG = "https://graph.instagram.com"
@@ -250,8 +250,10 @@ def save_settings(patch: dict) -> dict:
         for k, v in patch.items():
             if k not in SETTING_DEFAULTS:
                 continue
-            if k in ("paused", "tour_done"):
+            if k in ("paused", "tour_done", "watch_buffer"):
                 v = bool(v)
+            elif k == "watch_recordings":
+                v = max(1, min(30, int(v)))
             elif k == "digest_hour":
                 v = max(0, min(23, int(v)))
             else:

@@ -126,9 +126,9 @@ sponsor reading.
 
 ## What it does not do
 
-- **It does not watch the stream.** PeakCut reads words, loudness and chat. One frame
-  is looked at once, to find the webcam; it cannot tell that a headshot was good,
-  only that the streamer said something.
+- **Visual checks are sampled.** PeakCut reads words, loudness and chat. It checks
+  for the webcam when it cuts a clip. Watchlist recordings can also sample frames
+  near a reaction spike.
 - **It does not know the game's story.** "He got the polaroid photo" means
   nothing to it, unless the streamer says it.
 - **The game list is hand-written.** A game that is not in `GAMES` gets no
@@ -158,3 +158,43 @@ thread, so while a model is thinking the speech is still being written and
 `tests/test_games.py` (17 checks) covers the game reading, the tags, and that
 the game's tags are added to a post without losing the AI's own. It is in their
 suite as *"knowing which game a stream is"*.
+
+## Gaming watchlist
+
+1. Open **Watchlist** and select **Import 30 streamers**. The A, B and C entries are regular creator workspaces.
+   Importing again keeps edited links and settings. New entries start disabled. Enable channels you have permission
+   to record and reuse. **Edit** opens the existing creator setup, where you can change the channel, gameplay
+   layout or clip duration.
+2. Set the recording limit in Watchlist. The server allows three simultaneous recordings by default.
+   Change `PEAKCUT_MAX_LIVE` and restart PeakCut to raise the server ceiling. A lower Watchlist limit also applies
+   to new automatic recordings. CPU, free memory and disk space can delay recording while checks continue.
+3. For Discord, inject `DISCORD_CLIPS_WEBHOOK_URL` for **#clips**, `DISCORD_LIVE_WEBHOOK_URL` for **#live-streams**
+   and `DISCORD_STATUS_WEBHOOK_URL` for **#status** through your deployment's secrets or ignored `.env`.
+   A blank secret disables that feed. The channels receive ready clips and draft reviews, live transitions,
+   and recording, check or export problems respectively.
+4. Set up the existing [Buffer integration](README.md#save-a-tiktok-draft-in-buffer) with `BUFFER_API_KEY` and
+   `BUFFER_TIKTOK_CHANNEL_ID`. A PeakCut administrator can then select **Save TikTok drafts in Buffer**.
+   Finished, scored highlights from automatic watchlist recordings are exported for manual review in Buffer.
+   The link stays available for that rendered version until it is revoked or the clip changes.
+
+PeakCut checks active entries about every two minutes. The shared cache and rate-limit backoff apply across
+users. Priority A gets the first available slots, followed by B and C, without interrupting recordings already in
+progress. A failed check is shown as delayed. A recording that fails to start can be tried up to three times
+per broadcast. Disabling a streamer stops that streamer's watchlist recording.
+
+The watchlist uses the live transcript and the existing loudness and chat judges. When a strong reaction has no
+clear spoken highlight, a vision-capable model can check a few buffered frames. Selected windows include setup and
+payoff, and overlaps are filtered before rendering. The gameplay layout fills the 9:16 frame and includes a
+detected facecam. The preset allows clips up to 90 seconds. English captions use the existing translation path and
+require usable speech recognition and a working model. The crop can still lose a HUD at the frame edge. Use the
+existing layout editor before approving clips that need a wider view.
+
+Live access depends on each platform's public endpoints and yt-dlp support. Chat reactions are currently available
+on Twitch. Sampled frames may miss short action, and quiet events without a signal can be missed. The preset
+keeps the requested YouTube platform for TGG, whose own YouTube channel is `@TGG_`.
+[TGG's channel reference](https://www.youtube.com/watch?v=e_rL3O60-k8)
+
+Testing uses simulated platform, AI, Discord and Buffer responses and a locally generated racing-style video with
+a synthetic facecam. It does not require a live GTA 6 stream. The review workflow ends at a Buffer draft.
+A future automatic publishing mode can build on the saved per-clip draft identity. It needs a separate opt-in,
+an explicit rights check for that clip and a publication audit trail.

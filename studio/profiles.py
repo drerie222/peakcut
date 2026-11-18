@@ -23,6 +23,8 @@ from concurrent.futures import ThreadPoolExecutor
 _pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="profiles")   # lookups never pile up as thousands of threads
 _live: dict = {}          # channel link -> (when, result): everyone watching the same channel shares one check
 _live_locks: dict = {}
+_live_retry: dict = {}    # channel -> (deadline, failed attempts)
+_platform_retry: dict = {}
 LIVE_SHARED_FOR = 75      # seconds a live check is reused for every user
 
 _cache: dict = {}
@@ -149,7 +151,10 @@ def _twitch_live(login: str, off: dict) -> dict:
     r = httpx.post("https://gql.twitch.tv/gql", json={"query": q, "variables": {"l": login}},
                    headers={"Client-ID": _TWITCH_WEB, **UA}, timeout=8)
     r.raise_for_status()
-    user = ((r.json() or {}).get("data") or {}).get("user")
+    body = r.json()
+    if not isinstance(body.get("data"), dict) or "user" not in body["data"]:
+        raise ValueError("Twitch did not return a live status.")
+    user = body["data"]["user"]
     if user is None:
         return off                                   # no such channel
     st = user.get("stream")
@@ -239,12 +244,15 @@ def live_now(platform: str, url: str) -> dict:
         if re.fullmatch(r"\w{2,40}", login):
             try:
                 return _twitch_live(login, off)
-            except Exception:  # noqa: BLE001 - fall back to the slower way below
-                pass
+            except Exception as exc:  # noqa: BLE001 - no extra lookups while Twitch is rate limiting
+                if _http_status(exc) == 429:
+                    raise
         try:
             i = _ydl_info(url)
-        except Exception:
-            return off
+        except Exception as exc:
+            if "not live" in str(exc).lower() or "offline" in str(exc).lower():
+                return off
+            raise
         if not i.get("is_live"):
             return off
         title = _no_date(i.get("title"))
@@ -255,32 +263,57 @@ def live_now(platform: str, url: str) -> dict:
     return off
 
 
+def _http_status(exc):
+    return getattr(exc, "code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def _retry_after(exc):
+    headers = getattr(exc, "headers", None) or getattr(getattr(exc, "response", None), "headers", {})
+    try:
+        return max(0, int(headers.get("Retry-After", 0)))
+    except (ValueError, TypeError):
+        return 0
+
+
 def live_shared(platform: str, url: str) -> dict:
     """live_now, asked at most once per channel every LIVE_SHARED_FOR seconds however many people follow it.
     If a thousand users have the same creator, the platform is asked once, not a thousand times."""
     key = url.rstrip("/").lower()
-    got = _live.get(key)
-    if got and time.time() - got[0] < LIVE_SHARED_FOR:
-        return dict(got[1])
     with _lock:
         lock = _live_locks.setdefault(key, threading.Lock())
     with lock:                                   # the first asker looks it up; the rest wait for that answer
         got = _live.get(key)
         if got and time.time() - got[0] < LIVE_SHARED_FOR:
             return dict(got[1])
+        now = time.time()
+        until, failures = _live_retry.get(key, (0, 0))
+        if now < _platform_retry.get(platform, 0):
+            return {**(got[1] if got else {}), "error": "Platform rate limit. Waiting before checking again."}
+        if now < until:
+            return dict(got[1]) if got else {"error": "Could not check the channel. PeakCut will try again."}
         try:
             out = live_now(platform, url)
-        except Exception:
-            # the platform hiccuped, or the channel does not exist: keep the last answer (or "offline") for a
-            # short while, so one bad channel is not asked about again for every person who follows it
-            out = got[1] if got else {"live": False, "viewers": None, "title": "", "started": None, "embed": ""}
-            _live[key] = (time.time() - LIVE_SHARED_FOR + 45, out)
+        except Exception as exc:
+            failures = min(6, failures + 1)
+            until = time.time() + max(30 * 2 ** (failures - 1), _retry_after(exc))
+            limited = _http_status(exc) == 429
+            if limited:
+                with _lock:
+                    _platform_retry[platform] = max(_platform_retry.get(platform, 0), until)
+            message = ("Platform rate limit. Waiting before checking again." if limited
+                       else "Could not check the channel. PeakCut will try again.")
+            out = {**(got[1] if got else {}), "error": message}
+            _live[key] = (time.time() - LIVE_SHARED_FOR, out)
+            _live_retry[key] = (until, failures)
             return dict(out)
+        _live_retry.pop(key, None)
+        out["error"] = ""
         _live[key] = (time.time(), out)
         if len(_live) > 5000:
             for k in [k for k, v in list(_live.items()) if time.time() - v[0] > 600]:
                 _live.pop(k, None)
                 _live_locks.pop(k, None)
+                _live_retry.pop(k, None)
         return dict(out)
 
 

@@ -90,6 +90,8 @@ def enqueue(job, clip, account_ids, now=False) -> list:
 
 def on_clip_ready(job, clip):
     """Called once when a clip first finishes rendering."""
+    if job.get("watch_broadcast"):
+        return  # watchlist exports are reviewed as drafts in Buffer
     c = creators.get(job["creator"])
     if not c or not c["autopost"] or not c["accounts"]:
         return
