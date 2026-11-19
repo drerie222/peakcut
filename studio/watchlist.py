@@ -4,7 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
-from . import accounts, auth, buffer, config, creators, ctx, discord_clips, jobs, load, profiles, selection
+from . import accounts, auth, buffer, config, creators, ctx, discord_clips, jobs, load, profiles, render, selection
 
 PRESET = (
     ("A", "IShowSpeed", "youtube", "@IShowSpeed"), ("A", "Kai Cenat", "twitch", "kaicenat"),
@@ -79,7 +79,7 @@ def seed():
             else:
                 if len(rows) >= config.MAX_CREATORS:
                     continue
-                fresh = creators.create({"name": name, "channel": url, "layout": "gameplay",
+                fresh = creators.create({"name": name, "channel": url, "layout": render.FULL_GAMEPLAY,
                                          "min_len": 25, "max_len": 90, "trigger_words": ""}, watchlist=marker)
                 rows.append(fresh)
             added += 1

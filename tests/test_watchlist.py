@@ -40,7 +40,7 @@ def test_import(client):
           len(rows) == 30 and {c["watchlist"]["priority"] for c in rows} == {"A", "B", "C"}
           and {watchlist.channel_url(c["channel"])[0] for c in rows} == {"youtube", "twitch", "kick"})
     check("new entries are disabled, with gameplay layout and support for long clips",
-          all(not c["auto_watch"] and not c["autopost"] and c["layout"] == "gameplay" and c["max_len"] >= 60 for c in rows))
+          all(not c["auto_watch"] and not c["autopost"] and c["layout"] == render.FULL_GAMEPLAY and c["max_len"] >= 60 for c in rows))
     check("featured YouTube handles and the CaseOh underscore are retained",
           {"https://www.youtube.com/@IShowSpeed", "https://www.youtube.com/@TGG_", "https://www.twitch.tv/caseoh_"}
           <= {c["channel"] for c in rows})

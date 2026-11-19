@@ -70,8 +70,9 @@ A gaming stream is a 16:9 game with a small webcam picture in one corner. PeakCu
 below — fine for a talking head, poor for a game, where the play is a thin strip
 of the picture.
 
-The **gameplay** layout fits the full game into the 1080x1920 frame so edge HUDs remain visible. A detected
-webcam is enlarged in its own area above the game. The opening hook and captions have separate positions.
+The default **Full Gameplay / TikTok** layout fits the complete game into the 1080x1920 frame with black bands,
+separate positions for the hook and captions, and an optional facecam above the game. The earlier blurred
+**Gameplay + facecam** layout remains available. [Layout and rendered comparison](docs/FULL_GAMEPLAY_TIKTOK.md)
 
 To do that, PeakCut has to know where the webcam is. `studio/facecam.py` finds it
 by the one thing a webcam always has and a game almost never has: **a straight
@@ -137,7 +138,7 @@ sponsor reading.
 A launch-night roster of game streamers uses:
 
 ```json
-{ "style": "hype", "layout": "gameplay", "min_len": 15, "max_len": 60,
+{ "style": "hype", "layout": "full_gameplay", "min_len": 15, "max_len": 60,
   "max_clips": 6, "min_score": 65, "auto_watch": false, "buffer_min": 10,
   "live_per_hour": 4, "ai_every_min": 3, "ai_only_on_spike": true }
 ```

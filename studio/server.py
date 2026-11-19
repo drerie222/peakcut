@@ -657,7 +657,8 @@ def _creator_rows():
         if not c.get("watchlist") and profiles.needs_refresh(c):
             profiles.refresh(c["id"])
         s = live.active_for(c["id"])
-        out.append({**c, "live_job": s.job["id"] if s else None, "log": creators.read_log(c["id"], 30)})
+        out.append({**c, "layout": creators.layout_preference(c), "live_job": s.job["id"] if s else None,
+                    "log": creators.read_log(c["id"], 30)})
     return out
 
 
@@ -1243,7 +1244,7 @@ def edit_creator(cid: str, body: dict = Body(...)):
     if c.get("watchlist"):
         if s and not c["auto_watch"] and s.job.get("watch_broadcast"):
             s.stop("Watchlist monitoring disabled")
-        return c
+        return {**c, "layout": creators.layout_preference(c)}
     if "channels" in body or "channel" in body:
         profiles.refresh(cid, force=True)
     if body.get("auto_watch") and c.get("auto_watch") and not s:

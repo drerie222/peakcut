@@ -78,8 +78,33 @@ def install_fonts():
             shutil.copyfile(f, config.FONTS_DIR / f.name)
 
 
-LAYOUTS = {"blur": "Full frame + blurred fill", "zoom": "Zoomed in + blurred fill", "crop": "Fill the screen (centre crop)",
-           "gameplay": "Full gameplay with a separate facecam"}
+FULL_GAMEPLAY = "full_gameplay"
+GAMEPLAY_LAYOUTS = frozenset(("gameplay", FULL_GAMEPLAY))
+LAYOUTS = {FULL_GAMEPLAY: "Full Gameplay / TikTok", "blur": "Full frame + blurred fill", "zoom": "Zoomed in + blurred fill",
+           "crop": "Fill the screen (centre crop)", "gameplay": "Gameplay + facecam (blurred fill)"}
+
+_TIKTOK_TEXT_X = 490  # reserve more space for controls on the viewer's right
+_TIKTOK_CAPTION_Y = 1420
+_TIKTOK_GAME_MAX_H = 640
+_TIKTOK_FACE_CENTER = 516
+_TIKTOK_FACE_SIZE = (448, 216)
+
+
+def choose_layout(preference, gaming):
+    if preference in LAYOUTS:
+        return preference
+    return FULL_GAMEPLAY if gaming else "blur"
+
+
+def full_gameplay_region(width, height, sar=1.0, *, facecam=False):
+    """Largest square-pixel gameplay rectangle that fits without increasing either source dimension."""
+    aspect = width * sar / height
+    max_w, max_h = min(W, width) // 2 * 2, min(_TIKTOK_GAME_MAX_H, height) // 2 * 2
+    w = max(2, min(max_w, round(max_h * aspect / 2) * 2))
+    h = max(2, min(max_h, round(max_w / aspect / 2) * 2))
+    x = (W - w) // 4 * 2
+    y = ((1008 if facecam else 960) - h // 2) // 2 * 2
+    return x, y, w, h
 
 
 def _ts(t):
@@ -127,16 +152,22 @@ def geometry(src_w, src_h, layout):
     return layout, fg_h, max(230, top - 190), min(1640, top + fg_h + 180)
 
 
+def _hook_lines(words, font, size, max_width):
+    line = " ".join(words)
+    if len(words) < 2 or font.width(line, size) <= max_width:
+        return [line]
+    cut = min(range(1, len(words)), key=lambda i: max(font.width(" ".join(words[:i]), size),
+                                                     font.width(" ".join(words[i:]), size)))
+    return [" ".join(words[:cut]), " ".join(words[cut:])]
+
+
 def _hook_events(hook, dur, y):
     """The heading: dark text in a white rounded box that fits it, on one line or two balanced ones."""
     f, size = _Font.get(HOOK["font"]), HOOK["size"]
     words = hook.split()
     if not words:
         return []
-    lines = [" ".join(words)]
-    if f.width(lines[0], size) > HOOK["max_w"] and len(words) > 1:      # two lines, split where they come out most even
-        cut = min(range(1, len(words)), key=lambda i: max(f.width(" ".join(words[:i]), size), f.width(" ".join(words[i:]), size)))
-        lines = [" ".join(words[:cut]), " ".join(words[cut:])]
+    lines = _hook_lines(words, f, size, HOOK["max_w"])
     widest = max(f.width(l, size) for l in lines)
     if widest > HOOK["max_w"]:
         size = max(40, int(size * HOOK["max_w"] / widest))
@@ -158,8 +189,30 @@ def _hook_events(hook, dur, y):
     return ev
 
 
-def build_ass(words, start, end, hook, style_name, highlight, hook_y, cap_y, *, gameplay=False) -> str:
+def _tiktok_hook(hook, dur, y):
+    words = hook.split()[:5]
+    if not words:
+        return []
+    font, size, safe_width = _Font.get(HOOK["font"]), 112, 760
+    lines = _hook_lines(words, font, size, safe_width)
+    widest = max(font.width(line, size) for line in lines)
+    if widest > safe_width:
+        size = max(68, int(size * safe_width / widest))
+    for i, line in enumerate(lines):
+        if font.width(line, size) > safe_width:
+            while font.width(line + "…", size) > safe_width:
+                line = line[:-1]
+            lines[i] = line.rstrip() + "…"
+    line_h = font.em(size) * 1.15
+    return [f"Dialogue: 4,{_ts(0)},{_ts(dur)},Hook,,0,0,0,,"
+            f"{{\\an5\\pos({_TIKTOK_TEXT_X},{y + line_h * (i - (len(lines) - 1) / 2) - font.cap_shift(size):.0f})"
+            f"\\fs{size}\\1c&HFFFFFF&}}{line}" for i, line in enumerate(lines)]
+
+
+def build_ass(words, start, end, hook, style_name, highlight, hook_y, cap_y, *, gameplay=False, tiktok=False) -> str:
     st = STYLES.get(style_name, STYLES["bounce"])
+    if tiktok:
+        st = {**st, "font": HOOK["font"], "size": min(st["size"], 118)}
     words = [dict(w, s=w["s"] - CAPTION_LEAD, e=w["e"] - CAPTION_LEAD) for w in words]
     strong = {_key(h) for h in highlight if _key(h)}
     head = f"""[Script Info]
@@ -178,7 +231,9 @@ Style: Hook,{HOOK['font']},{HOOK['size']},&H00{HOOK['ink']},&H00{HOOK['ink']},&H
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     dur = end - start
-    ev = _hook_events(_clean(hook), min(dur, 3.0) if gameplay else dur, hook_y)
+    heading = _tiktok_hook if tiktok else _hook_events
+    ev = heading(_clean(hook), min(dur, 3.0) if gameplay else dur, hook_y)
+    cap_x = _TIKTOK_TEXT_X if tiktok else W // 2
     f = _Font.get(st["font"])
     inside = [dict(w, w=_clean(w["w"])) for w in words if w["s"] >= start - 0.05 and w["s"] < end]
     inside = sorted((w for w in inside if w["w"]), key=lambda w: w["s"])
@@ -199,18 +254,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             # they are not placed one by one. The line is drawn whole and centred, in a font the system has for it.
             line = " ".join(texts)
             fs = max(44, min(int(st["size"] * 0.7), int(1500 / max(1, len(line)) * 1.6)))
-            ev.append(f"Dialogue: 1,{_ts(g_start)},{_ts(g_end)},Cap,,60,60,0,,{{\\an5\\pos({W // 2},{cap_y:.0f})\\q0\\fs{fs}}}{line}")
+            ev.append(f"Dialogue: 1,{_ts(g_start)},{_ts(g_end)},Cap,,60,60,0,,{{\\an5\\pos({cap_x},{cap_y:.0f})\\q0\\fs{fs}}}{line}")
             continue
         size = st["size"]
         gap = f.width("n n", size) - 2 * f.width("n", size) + (2 * st["outline"] + 6) * size / st["size"]   # a space, plus room for both outlines
         total = sum(f.width(t, size) for t in texts) + gap * (len(texts) - 1)
-        cap_width = 820 if gameplay else CAP_MAX_W
+        cap_width = 740 if tiktok else 820 if gameplay else CAP_MAX_W
         if total > cap_width:                                  # a long phrase: shrink it to fit, never run off the frame
-            size = max(36, int(size * cap_width / total))
+            size = max(1 if tiktok else 36, int(size * cap_width / total))
             gap = f.width("n n", size) - 2 * f.width("n", size) + (2 * st["outline"] + 6) * size / st["size"]   # a space, plus room for both outlines
             total = sum(f.width(t, size) for t in texts) + gap * (len(texts) - 1)
         cy = cap_y - f.cap_shift(size)
-        x = (W - total) / 2
+        x = cap_x - total / 2
         p = st["pop"]
         for i, (w, t) in enumerate(zip(g, texts)):
             wd = f.width(t, size)
@@ -245,6 +300,25 @@ def _face_crop(face, width, height):
     return left, top, right - left, bottom - top
 
 
+def gameplay_mask(facecam, width, height):
+    face = _face_crop(facecam, width, height)
+    return tuple(value / bound for value, bound in zip(face, (width, height, width, height))) if face else None
+
+
+def _tiktok_filter(region, original_size, facecam):
+    x, y, w, h = region
+    game_scale = f"scale={w}:{h}:flags=lanczos," if (w, h) != original_size else ""
+    game = f"{game_scale}setsar=1,pad={W}:{H}:{x}:{y}:color=black"
+    if not facecam:
+        return f"[0:v]fps={config.OUT_FPS},{game}[v0];"
+    fx, fy, fw, fh = facecam
+    face_w, face_h = _TIKTOK_FACE_SIZE
+    return (f"[0:v]fps={config.OUT_FPS},split=2[game][face];[game]{game}[b];"
+            f"[face]crop={fw}:{fh}:{fx}:{fy},scale={face_w}:{face_h}:force_original_aspect_ratio=decrease:"
+            f"force_divisible_by=2:flags=lanczos,setsar=1[p];"
+            f"[b][p]overlay={_TIKTOK_TEXT_X}-w/2:{_TIKTOK_FACE_CENTER}-h/2[v0];")
+
+
 def _filter(layout, fg_h, facecam=None):
     if layout == "gameplay":
         split = "split=3[bg][game][fc]" if facecam else "split=2[bg][game]"
@@ -272,14 +346,23 @@ _qsv_ok = None
 RENDER_SECONDS = 600      # one clip's video encode; far beyond normal, so a frozen encoder is stopped, not waited on
 
 
-def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, src_w: int, src_h: int) -> dict:
+def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, src_w: int, src_h: int, *, sar=1.0) -> dict:
     """Writes <name>.mp4, <name>.jpg and <name>.ass into out_dir. Returns file names."""
     out_dir.mkdir(parents=True, exist_ok=True)
     start, end = clip["start"], clip["end"]
-    layout, fg_h, hook_y, cap_y = geometry(src_w, src_h, clip.get("layout", "blur"))
-    face = _face_crop(clip.get("facecam"), src_w, src_h) if layout == "gameplay" else None
+    tiktok = clip.get("layout") == FULL_GAMEPLAY
+    face = _face_crop(clip.get("facecam"), src_w, src_h) if clip.get("layout") in GAMEPLAY_LAYOUTS else None
+    if tiktok:
+        layout = FULL_GAMEPLAY
+        region = full_gameplay_region(src_w, src_h, sar, facecam=bool(face))
+        hook_y, cap_y = (292 if face else 380), _TIKTOK_CAPTION_Y
+        filters = _tiktok_filter(region, (src_w, src_h), face)
+    else:
+        layout, fg_h, hook_y, cap_y = geometry(src_w, src_h, clip.get("layout", "blur"))
+        filters = _filter(layout, fg_h, face)
     ass = build_ass(words if clip.get("captions", True) else [], start, end, clip.get("hook", ""), clip.get("style", "bounce"),
-                    clip.get("highlight_words", []), hook_y, cap_y, gameplay=bool(clip.get("gameplay_source") or layout == "gameplay"))
+                    clip.get("highlight_words", []), hook_y, cap_y,
+                    gameplay=bool(clip.get("gameplay_source") or layout in GAMEPLAY_LAYOUTS), tiktok=tiktok)
     # The clip is made in a short work folder and moved into place afterwards. The caption step of ffmpeg cannot
     # open files whose full path is longer than 260 characters on Windows, which a data folder deep inside other
     # folders easily reaches. Inside the work folder every name is short and relative (a drive colon would also
@@ -287,18 +370,22 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     work = Path(tempfile.mkdtemp(prefix="pk"))
     try:
         with load.heavy_work(writes_video=True):
-            return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass, face=face)
+            files = _render_in(work, src, out_dir, name, start, end, layout, filters, ass)
+        if tiktok:
+            files["gameplay_region"] = region
+            files["gameplay_mask"] = gameplay_mask(clip.get("facecam"), src_w, src_h)
+        return files
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, fg_h, ass: str, face=None) -> dict:
+def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, filters, ass: str) -> dict:
     global _qsv_ok
     (work / f"{name}.ass").write_text(ass, encoding="utf-8")
     (work / "f").mkdir()
     for f in config.FONTS_DIR.glob("*.ttf"):
         shutil.copyfile(f, work / "f" / f.name)
-    fc = _filter(layout, fg_h, face) + f"[v0]ass={name}.ass:fontsdir=f[v]"
+    fc = filters + f"[v0]ass={name}.ass:fontsdir=f[v]"
     threads = load.ffmpeg_threads()
     filters = ["-filter_threads", str(config.FFMPEG_THREADS), "-filter_complex_threads", str(config.FFMPEG_THREADS)] if threads else []
     base = ["ffmpeg", "-y", "-v", "error", *filters, "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", *threads, "-i", str(src),
