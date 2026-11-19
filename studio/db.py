@@ -9,7 +9,8 @@ import sqlalchemy as sa
 from . import config
 
 _SQLITE = config.DATABASE_URL.startswith("sqlite")
-engine = sa.create_engine(config.DATABASE_URL, pool_pre_ping=not _SQLITE, future=True, pool_size=20, max_overflow=40,
+engine = sa.create_engine(config.DATABASE_URL, pool_pre_ping=not _SQLITE, future=True,
+                          pool_size=4 if config.LOW_RESOURCE else 20, max_overflow=4 if config.LOW_RESOURCE else 40,
                           **({"connect_args": {"timeout": 30}} if _SQLITE else {}))
 
 if _SQLITE:

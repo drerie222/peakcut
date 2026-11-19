@@ -29,9 +29,10 @@ class _FairQueue:
         self.held = False                     # videos are waiting only because the machine is near full
 
     def _room(self) -> bool:
-        """May one more video start? One always may. More only while the machine has room, and a few seconds
-        after the last one started, so its weight is already showing in the measurements."""
+        """Admit the first video if storage and memory allow it. Further workers also need CPU headroom."""
         if self.running == 0:
+            if config.LOW_RESOURCE and (load.render_disk_full() or load.memory_low()):
+                return False
             return True
         return self.running < config.JOB_WORKERS and time.time() - self.last_start > 6 and not load.busy()
 
@@ -101,7 +102,7 @@ class _FairQueue:
 
 
 _q = _FairQueue()
-_live_q: "queue.Queue" = queue.Queue()   # live clips never wait behind a long video
+_live_q: "queue.Queue" = queue.Queue(config.MAX_QUEUED_RENDERS)   # producers pause when live renders fall behind
 _jobs: dict = {}
 _by_user: dict = {}                       # user -> {job id: job}: listing one person's videos never scans everyone's
 _lock = threading.RLock()
@@ -227,6 +228,9 @@ def _load_file(f: Path, uid: str):
                 job["recover"] = True
             elif job.get("resume"):
                 c["status"] = "queued"  # the video is being picked up again: this clip is made then
+            elif job.get("kind") == "live" and c.get("src") and Path(c["src"]).is_file():
+                c["status"] = "queued"
+                job.setdefault("remake", []).append(c["id"])
             elif job.get("kind") != "live" and (f.parent / "words.json").is_file():
                 c["status"] = "queued"  # a single clip being re-made: jobs.start() makes it again
                 job.setdefault("remake", []).append(c["id"])
@@ -342,9 +346,24 @@ def delete(jid):
     return bool(job)
 
 
+class RenderQueueFull(ValueError):
+    pass
+
+
 def request_render(jid, cid, changes: dict):
+    with _lock, _q.cv:
+        if len(_q.quick) >= config.MAX_QUEUED_RENDERS:
+            raise RenderQueueFull("The render queue is full. Try again when a clip finishes.")
+        _request_render(jid, cid, changes)
+
+
+def _request_render(jid, cid, changes):
     job = _jobs[jid]
     clip = next(c for c in job["clips"] if c["id"] == cid)
+    if clip.get("raw_expired"):
+        raise ValueError("This clip's raw recording has expired. You can still download the finished clip.")
+    if clip.get("status") in ("queued", "rendering"):
+        raise ValueError("This clip is already being made.")
     new = dict(clip)
     if "captions" in changes:
         new.update(clean_options({"captions": changes["captions"]}))
@@ -375,6 +394,7 @@ def render_one(job, clip, words):
     clip["status"] = "rendering"
     save(job)
     try:
+        load.wait_for_disk()
         if not clip.get("src") and not job.get("source_path"):
             _piece_again(job, clip)
         off = clip.get("src_offset", 0.0)
@@ -605,11 +625,13 @@ def _run_job(job):
         if not job.get("thumb") and media.save_thumb(d, video=audio_file):
             _set(job, thumb=True)
     wav = d / "audio.wav"
-    media.extract_audio(audio_file, wav)
-    audio = media.load_audio(wav)
-    wav.unlink(missing_ok=True)
-    if src["type"] == "url":
-        audio_file.unlink(missing_ok=True)
+    try:
+        media.extract_audio(audio_file, wav)
+        audio = media.load_audio(wav)
+    finally:
+        wav.unlink(missing_ok=True)
+        if src["type"] == "url":
+            audio_file.unlink(missing_ok=True)
     if not job["duration"]:
         job["duration"] = len(audio) / 16000
     lo = int((o["range_start"] or 0) * 16000)
@@ -643,6 +665,7 @@ def _run_job(job):
     began = {}      # clip id -> when work on it started
 
     def make(clip, words_now):
+        load.wait_for_disk()
         began[clip["id"]] = time.time()
         if src["type"] == "url" and (pieces or not whole_video()):
             _fetch_piece(job, clip, audio)
@@ -661,8 +684,15 @@ def _run_job(job):
             render_one(job, clip, words_now)
 
     cpus = os.cpu_count() or 4
-    renders = ThreadPoolExecutor(2 if cpus < 8 else min(6, cpus // 6))  # more clips made at once on a bigger machine
+    renders = None if config.LOW_RESOURCE else ThreadPoolExecutor(2 if cpus < 8 else min(6, cpus // 6))
     futures = []
+
+    def make_clip(clip):
+        if renders is None:
+            make(clip, words)
+        else:
+            futures.append((renders.submit(ctx.bind(make), clip, list(words)), clip))
+
     step = BLOCK * 16000 if span > PROGRESSIVE_FROM else hi - lo
     blocks = [(x, min(hi, x + step)) for x in range(lo, hi, step)] or [(lo, hi)]
     words, tokens, model = [], 0, None
@@ -690,7 +720,7 @@ def _run_job(job):
         for c in job["clips"]:            # clips found before the restart that were not finished yet
             if c.get("status") not in ("done", "error"):
                 c["status"] = "queued"
-                futures.append((renders.submit(ctx.bind(make), c, list(words)), c))
+                make_clip(c)
         save(job)
     # The transcript of the next part is written while the AI is still reading this one (the AI is a wait on the
     # network, the transcript is work on this machine), so neither waits for the other.
@@ -723,7 +753,8 @@ def _run_job(job):
             _set(job, stage="Writing the transcript" + where)
             now_on[0] = bi
             hear(bi)
-            hear(bi + 1)
+            if not config.LOW_RESOURCE:
+                hear(bi + 1)
             bw = heard.pop(bi).result()
         _set(job, progress=max(job["progress"], 0.14 + 0.78 * (b - lo) / max(1, hi - lo)))
         words += [dict(w, s=round(w["s"] + shift, 2), e=round(w["e"] + shift, 2)) for w in bw]
@@ -754,6 +785,7 @@ def _run_job(job):
                 else:
                     keep.append(c)
             found = keep
+        block_clips = []
         for c in found:
             c.update(id=f"clip{len(job['clips']) + 1:02d}", start=round(c["start"] + shift, 2),
                      end=round(c["end"] + shift, 2), style=o["style"], layout=o["layout"],
@@ -765,19 +797,22 @@ def _run_job(job):
             if face:
                 c["facecam"] = face
             job["clips"].append(c)
-            futures.append((renders.submit(ctx.bind(make), c, list(words)), c))
+            block_clips.append(c)
         job["ai"] = {"model": model, "tokens": tokens, "note": "", "log": notes[-5:]}
         job["done_blocks"] = bi + 1       # a restart from here on carries on with the next part
         save(job)
+        for c in block_clips:
+            make_clip(c)
     if futures:
         _set(job, stage="Finishing the clips", progress=max(job["progress"], 0.92))
-    _wait_for_clips(job, futures, began, renders._max_workers)
+        _wait_for_clips(job, futures, began, renders._max_workers)
     if exact:           # keep our own words for the clips in the saved transcript, so editing a clip later uses them
         for a_s, b_s, tw in exact.values():
             words = [w for w in words if not a_s <= w["s"] < b_s] + tw
         words.sort(key=lambda w: w["s"])
         (d / "words.json").write_text(json.dumps(words), encoding="utf-8")
-    renders.shutdown(wait=False)
+    if renders is not None:
+        renders.shutdown(wait=False)
     ahead.shutdown(wait=False)
     fetch.shutdown(wait=False)
     del audio
@@ -817,8 +852,9 @@ def _worker(quick_only=False):
             else:
                 clip = next(c for c in job["clips"] if c["id"] == cid)
                 words = []
-                if clip.get("captions", True):
-                    words = json.loads((Path(job["dir"]) / "words.json").read_text(encoding="utf-8"))
+                transcript = Path(job["dir"]) / "words.json"
+                if clip.get("captions", True) and transcript.is_file():
+                    words = json.loads(transcript.read_text(encoding="utf-8"))
                 render_one(job, clip, words)
         except Exception as e:  # noqa: BLE001
             (Path(job["dir"]) / "error.log").write_text(traceback.format_exc(), encoding="utf-8")

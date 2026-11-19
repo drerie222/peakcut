@@ -397,6 +397,8 @@ def google_finish(code: str, state: str):
         mark_verified(u.id)
         save_photo(u.id, pic)
         return get_user(u.id), False, st[1]
+    if not config.ALLOW_SIGNUP:
+        raise AuthError("Sign-up is closed. Ask the server administrator for an account.")
     u, first = _create(email, info.get("name") or "", google_sub=info["sub"])
     save_photo(u.id, pic)
     return u, first, st[1]

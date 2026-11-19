@@ -153,7 +153,27 @@ def _existing_draft(row, clip):
 def status(job_id, clip):
     with db.engine.connect() as cn:
         row = cn.execute(sa.select(_table).where(_match(job_id, clip["id"]))).first()
-    return _draft_status(row, clip)
+    state = _draft_status(row, clip)
+    if row and row.post_id and clip.get("buffer_remote_status"):
+        state["publication"] = clip["buffer_remote_status"]
+    return state
+
+
+def refresh_publication(job_id, clip):
+    """Read one existing post on demand, keeping the API budget for actual drafts."""
+    key = config.buffer_api_key()
+    if not configured() or not key:
+        raise Error(503, "Set up Buffer first.")
+    with db.engine.connect() as cn:
+        post_id = cn.execute(sa.select(_table.c.post_id).where(_match(job_id, clip["id"]))).scalar()
+    if not post_id:
+        raise Error(404, "No confirmed Buffer draft for this clip.")
+    query = "query ClipPostStatus($input: PostInput!) { post(input: $input) { id status } }"
+    post = _request(key, query, {"input": {"id": post_id}}).get("post")
+    if not isinstance(post, dict) or post.get("id") != post_id or post.get("status") not in (
+            "draft", "error", "needs_approval", "scheduled", "sending", "sent"):
+        raise Error(502, "Buffer did not confirm the publication status.")
+    clip["buffer_remote_status"] = post["status"]
 
 
 def revoke(job_id, clip_id):

@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from . import config
+from . import config, load
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -310,8 +310,10 @@ def probe(path: Path) -> dict:
 def extract_audio(src: Path, wav: Path):
     # first_pts=0 pads any gap before the audio starts, so second 0 of the wav is second 0 of the file
     # -t: never more audio than the longest video allowed, whatever the file claims about itself
-    run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000", "-t", str(int(config.MAX_VIDEO_HOURS * 3600) + 60),
-         "-af", "aresample=async=1:first_pts=0", "-c:a", "pcm_s16le", str(wav)])
+    with load.heavy_work(writes_video=True):
+        run(["ffmpeg", "-y", "-v", "error", *load.ffmpeg_threads(), "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
+             "-t", str(int(config.MAX_VIDEO_HOURS * 3600) + 60),
+             "-af", "aresample=async=1:first_pts=0", "-c:a", "pcm_s16le", str(wav)])
 
 
 def load_audio(wav: Path) -> np.ndarray:

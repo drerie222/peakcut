@@ -1,0 +1,41 @@
+# Single-owner test server. Compose 2.24.4+ is required for !reset.
+services:
+  db:
+    cpus: 0.30
+    mem_limit: 384m
+    memswap_limit: 384m
+    command: ["postgres", "-c", "max_connections=20", "-c", "shared_buffers=64MB",
+              "-c", "effective_cache_size=256MB", "-c", "work_mem=2MB", "-c", "maintenance_work_mem=32MB"]
+  app:
+    ports: !reset []
+    cpus: 1.50
+    mem_limit: 2816m
+    memswap_limit: 2816m
+    environment:
+      PEAKCUT_ACCOUNTS: "1"
+      PEAKCUT_ALLOW_SIGNUP: "0"
+      PEAKCUT_DRAFT_ONLY: "1"
+      PEAKCUT_LOW_RESOURCE: "1"
+      PEAKCUT_MAX_LIVE: "${PEAKCUT_MAX_LIVE:-1}"
+      PEAKCUT_MAX_LIVE_PER_USER: "${PEAKCUT_MAX_LIVE_PER_USER:-1}"
+      PEAKCUT_MAX_LIVE_HOURS: "${PEAKCUT_MAX_LIVE_HOURS:-6}"
+      PEAKCUT_MAX_VIDEO_HOURS: "${PEAKCUT_MAX_VIDEO_HOURS:-2}"
+      PEAKCUT_MAX_UPLOAD_MB: "${PEAKCUT_MAX_UPLOAD_MB:-2048}"
+      PEAKCUT_JOB_WORKERS: "1"
+      PEAKCUT_REQUEST_THREADS: "12"
+      PEAKCUT_ASR_COPIES: "1"
+      PEAKCUT_ASR_THREADS: "1"
+      PEAKCUT_FFMPEG_THREADS: "1"
+      PEAKCUT_OUT_FPS: "${PEAKCUT_OUT_FPS:-24}"
+      PEAKCUT_MIN_FREE_RAM_GB: "${PEAKCUT_MIN_FREE_RAM_GB:-0.55}"
+      PEAKCUT_MIN_FREE_DISK_GB: "${PEAKCUT_MIN_FREE_DISK_GB:-12}"
+      PEAKCUT_RAW_RETENTION_HOURS: "${PEAKCUT_RAW_RETENTION_HOURS:-168}"
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+  caddy:
+    cpus: 0.15
+    mem_limit: 96m
+    memswap_limit: 96m
+    depends_on:
+      app:
+        condition: service_healthy

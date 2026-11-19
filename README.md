@@ -206,6 +206,7 @@ are sent to GitHub; set `PEAKCUT_UPDATE_CHECK=0` to turn the check off.
 ## Deploy
 
 [DEPLOY.md](DEPLOY.md) walks through a single server with Docker: the app, PostgreSQL, and Caddy for HTTPS.
+For 2 shared vCPUs, 4 GB RAM and an 80 GB disk, see the [Hetzner setup and operating limits](HETZNER.md).
 
 ```bash
 docker compose up -d --build

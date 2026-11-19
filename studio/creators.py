@@ -162,6 +162,11 @@ def update(cid, data: dict) -> dict:
         new["channels"] = {**c["channels"], platform_key(new["channel"]): new["channel"]}
     c.update(new)
     _fix(c)
+    if "watch_priority" in data:
+        priority = data["watch_priority"]
+        if not c.get("watchlist") or priority not in ("A", "B", "C"):
+            raise ValueError("Choose a watchlist priority from A to C.")
+        c["watchlist"]["priority"] = priority
     if c.get("watchlist"):
         from .watchlist import channel_url
         for url in c["channels"].values():

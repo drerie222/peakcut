@@ -7,6 +7,9 @@ import os
 import shutil
 import threading
 import time
+import tempfile
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 
 from . import config
@@ -21,6 +24,9 @@ _state = {"cpu": 0.0, "ram_free": 99.0, "disk_free": 99.0, "at": 0.0}
 _force = None            # tests only: pretend the server is busy (True) or free (False)
 _started = False
 _lock = threading.Lock()
+_cpu_slot = threading.RLock()
+_ai_slot = threading.Lock()
+_working = threading.local()
 
 
 def _cpu_times():
@@ -38,17 +44,24 @@ def _cpu_times():
     return sum(v) - v[3] - v[4], sum(v)                                    # everything except idle and waiting on disk
 
 
-def _cgroup_cpu_reader():
-    """Read CPU time for the group whose quota limits this process, if there is one."""
+def _cgroup_dirs():
     path = next((line[3:] for line in _CGROUP_MEMBERSHIP.read_text().splitlines()
                  if line.startswith("0::/")), None)
     if path is None or ".." in Path(path).parts:
-        return None
+        return
 
     group = _CGROUP_ROOT / path.lstrip("/")
+    for directory in (group, *group.parents):
+        yield directory
+        if directory == _CGROUP_ROOT:
+            break
+
+
+def _cgroup_cpu_reader():
+    """Read CPU time for the group whose quota limits this process, if there is one."""
     limit = os.cpu_count() or float("inf")
     stats = None
-    for directory in (group, *group.parents):
+    for directory in _cgroup_dirs():
         try:
             quota, period = (directory / "cpu.max").read_text().split()
             if quota != "max":
@@ -57,8 +70,6 @@ def _cgroup_cpu_reader():
                     limit, stats = cores, directory / "cpu.stat"
         except (OSError, ValueError, ZeroDivisionError):
             pass
-        if directory == _CGROUP_ROOT:
-            break
 
     if stats is None:
         return None
@@ -71,6 +82,23 @@ def _cgroup_cpu_reader():
         raise ValueError("No CPU usage in cpu.stat")
 
     return read
+
+
+def _cgroup_ram_gb(directories):
+    headroom = float("inf")
+    for directory in directories:
+        try:
+            ceiling = (directory / "memory.max").read_text().strip()
+            if ceiling == "max":
+                continue
+            current = int((directory / "memory.current").read_text())
+            stat = dict(line.split() for line in (directory / "memory.stat").read_text().splitlines())
+            limit = int(ceiling)
+            available = min(limit, max(0, limit - current + int(stat.get("inactive_file", 0))))
+            headroom = min(headroom, available / 1e9)
+        except (OSError, ValueError):
+            continue
+    return headroom
 
 
 def _ram_free_gb() -> float:
@@ -87,7 +115,11 @@ def _ram_free_gb() -> float:
     with open("/proc/meminfo", encoding="ascii") as f:
         for line in f:
             if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) / 1e6
+                host = int(line.split()[1]) / 1e6
+                try:
+                    return min(host, _cgroup_ram_gb(_cgroup_dirs()))
+                except OSError:
+                    return host
     return 99.0
 
 
@@ -125,6 +157,7 @@ def _watch():
         try:
             if time.time() - _state["at"] > 15:
                 _state["disk_free"] = shutil.disk_usage(config.DATA_DIR).free / 1e9
+                _state["render_free"] = shutil.disk_usage(tempfile.gettempdir()).free / 1e9
                 _state["at"] = time.time()
         except Exception:  # noqa: BLE001
             pass
@@ -149,6 +182,66 @@ def busy() -> bool:
 def disk_full() -> bool:
     start()
     return _state["disk_free"] < MIN_FREE_DISK_GB
+
+
+def memory_low() -> bool:
+    start()
+    return _state["ram_free"] < MIN_FREE_RAM_GB
+
+
+def render_disk_full() -> bool:
+    return disk_full() or _state.get("render_free", 99) < MIN_FREE_DISK_GB
+
+
+def wait_for_disk():
+    while render_disk_full():
+        time.sleep(1)
+
+
+@contextmanager
+def heavy_work(*, writes_video=False):
+    """Put local ASR, frame scans and encodes in the same lane on small machines."""
+    if getattr(_working, "active", False):
+        yield
+        return
+    if not config.LOW_RESOURCE:
+        if writes_video:
+            wait_for_disk()
+        yield
+        return
+    # Release the lane while space or headroom is unavailable so maintenance and the other work can proceed.
+    while True:
+        with _cpu_slot:
+            if not busy() and not (writes_video and render_disk_full()):
+                _working.active = True
+                try:
+                    yield
+                finally:
+                    _working.active = False
+                return
+        time.sleep(1)
+
+
+def serial_work(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        with heavy_work():
+            return fn(*args, **kwargs)
+    return run
+
+
+def serial_ai(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        if not config.LOW_RESOURCE:
+            return fn(*args, **kwargs)
+        with _ai_slot:
+            return fn(*args, **kwargs)
+    return run
+
+
+def ffmpeg_threads():
+    return ["-threads", str(config.FFMPEG_THREADS)] if config.LOW_RESOURCE else []
 
 
 def state() -> dict:

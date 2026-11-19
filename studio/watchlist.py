@@ -4,7 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
-from . import accounts, auth, buffer, config, creators, ctx, discord_clips, jobs, load, profiles
+from . import accounts, auth, buffer, config, creators, ctx, discord_clips, jobs, load, profiles, selection
 
 PRESET = (
     ("A", "IShowSpeed", "youtube", "@IShowSpeed"), ("A", "Kai Cenat", "twitch", "kaicenat"),
@@ -24,7 +24,9 @@ PRESET = (
 )
 _HOSTS = {"youtube": "www.youtube.com", "twitch": "www.twitch.tv", "kick": "kick.com"}
 _PLATFORMS = {"youtube": "YouTube", "twitch": "Twitch", "kick": "Kick"}
-_probes = ThreadPoolExecutor(max_workers=4, thread_name_prefix="watchlist")
+_probes = ThreadPoolExecutor(max_workers=2, thread_name_prefix="watchlist")
+_decisions = {}
+_challengers = {}
 
 
 def channel_url(raw):
@@ -89,7 +91,7 @@ def _probe(creator):
         platform, url = channel_url(creator["channel"])
     except ValueError:
         return "", {"error": "Check the channel link."}
-    return _PLATFORMS[platform], profiles.live_shared(_PLATFORMS[platform], url)
+    return _PLATFORMS[platform], profiles.live_shared(_PLATFORMS[platform], url, pace=True)
 
 
 def _observation(c, platform, info):
@@ -103,7 +105,10 @@ def _observation(c, platform, info):
     elif state == "offline":
         broadcast = ""
     title = str(info.get("title") or old.get("title") or "")[:160] if state != "offline" else ""
+    since = old.get("live_since") if broadcast and broadcast == old.get("broadcast") else None
     value = {"state": state, "platform": platform, "title": title, "error": error, "broadcast": broadcast,
+             "live_since": since or (time.time() if broadcast else None),
+             "category": str(info.get("category") or "")[:100],
              "embed": info.get("embed") or "", "started": info.get("started")}
     current = creators.watch_status(c["id"], c["channel"], value)
     if not current:
@@ -125,39 +130,119 @@ def recording_limit():
     return max(0, min(int(accounts.settings()["watch_recordings"]), config.MAX_LIVE_TOTAL, config.MAX_LIVE_PER_USER))
 
 
+def decisions():
+    return _decisions.get(ctx.uid(), {})
+
+
+def _show(rows):
+    if rows != decisions():
+        _decisions[ctx.uid()] = rows
+        ctx.bump()
+
+
+def _can_record(c, history, now):
+    status = c.get("watch_status") or {}
+    if status.get("state") != "live" or not status.get("live_since"):
+        return False
+    prior = [j for j in history if j.get("watch_broadcast") == status["broadcast"]
+             and j.get("watch_channel") == c["channel"]]
+    if any(j.get("watch_stopped") for j in prior):
+        return False
+    failed = [j for j in prior if j.get("status") == "error" and not j.get("duration")]
+    return len(failed) < 3 and (not failed or now - failed[0]["created"] >= 120 * 2 ** (len(failed) - 1))
+
+
+def _rotate(active, waiting, rows, last_switch, now):
+    uid = ctx.uid()
+    if not active or not waiting or not active.job.get("watch_broadcast"):
+        _challengers.pop(uid, None)
+        return
+    job = active.job
+    challenger = waiting[0]
+    current = rows.get(job["creator"])
+    lead = rows[challenger["id"]]["points"] - current["points"] if current else 0
+    key = (job["id"], challenger["id"])
+    confirmed = _challengers.get(uid) == key
+    if lead >= config.WATCH_SWITCH_MARGIN:
+        _challengers[uid] = key
+    else:
+        _challengers.pop(uid, None)
+    reason = selection.rotation_reason(now - active.started_at, now - last_switch, lead, confirmed)
+    if reason:
+        job.update(watch_switch_to=challenger["id"], watch_switched_at=now)
+        active.stop(reason)
+        jobs.save(job)
+        rows[challenger["id"]]["reason"] = f"Next after handoff · {reason}"
+        _challengers.pop(uid, None)
+
+
 def poll(todo):
-    """Check every enabled channel, then take available recording slots in priority order."""
+    """Check enabled channels, rank known live streams and hand off a full slot when justified."""
     from . import live
     observed = list(_probes.map(_probe, todo))
     for c, (platform, info) in zip(todo, observed):
         _observation(c, platform, info)
     # Fetch the current settings after the network checks. A disabled or edited channel stays stopped.
     limit = recording_limit()
-    full, busy = load.disk_full(), load.busy()
+    full, busy = load.render_disk_full(), load.busy()
     day = time.strftime("%Y-%m-%d")
-    health = "Disk space is low." if full else "CPU or memory load is high." if busy else "Watchlist is checking channels."
-    discord_clips.event("status", f"{day}:{health}", health)
+    if not full:
+        health = "CPU or memory load is high." if busy else "Watchlist is checking channels."
+        discord_clips.event("status", f"{day}:{health}", health)
     history = jobs.list_jobs()
+    by_creator = {}
+    for job in history:
+        by_creator.setdefault(job["creator"], []).append(job)
+    now = time.time()
+    candidates, blocked = [], {}
     for c in todo:
         current = creators.get(c["id"])
         if not current or not current["auto_watch"] or current["channel"] != c["channel"]:
             continue
-        status = current.get("watch_status") or {}
-        if status.get("state") != "live" or live.active_for(c["id"]) or len(live.active()) >= limit or full or busy:
-            continue
-        broadcast = status["broadcast"]
-        previous = [j for j in history if j["creator"] == c["id"] and j.get("watch_broadcast") == broadcast
-                    and j.get("watch_channel") == c["channel"]]
-        if len(previous) >= 3 or any(j.get("watch_stopped") for j in previous):
-            continue
-        if previous and time.time() - previous[0]["created"] < (120 * 2 ** (len(previous) - 1)):
-            continue
+        if _can_record(current, by_creator.get(c["id"], ()), now):
+            candidates.append(current)
+        elif (current.get("watch_status") or {}).get("state") == "live":
+            blocked[c["id"]] = {"reason": "Stopped manually or waiting after recording failures"}
+    order, rows = selection.rank(candidates, by_creator, now)
+    rows.update(blocked)
+    own = {s.job["creator"]: s for s in live.active_mine()}
+    waiting = [c for c in order if c["id"] not in own]
+    switched = max((j for j in history if j.get("watch_switched_at")), key=lambda j: j["watch_switched_at"], default={})
+    last_switch = switched.get("watch_switched_at", 0)
+    if now - last_switch < config.WATCH_COOLDOWN_SEC:
+        first = switched.get("watch_switch_to")
+        if any(c["id"] == first for c in waiting):
+            waiting.sort(key=lambda c: c["id"] != first)
+    for c in order:
+        row = rows[c["id"]]
+        row["reason"] = ("Recording · retaining the current slot" if c["id"] in own
+                         else "Waiting for disk space" if full else "Waiting for CPU or memory" if busy
+                         else "Waiting for the next turn · long wait" if row["waiting_sec"] >= config.WATCH_FAIR_WAIT_SEC
+                         else "Waiting for a recording slot")
+    if full or busy or limit == 0:
+        _challengers.pop(ctx.uid(), None)
+        _show(rows)
+        return
+    if live.recording_count() >= limit:
+        if limit == 1 and len(own) == 1:
+            _rotate(next(iter(own.values())), waiting, rows, last_switch, now)
+        _show(rows)
+        return
+    _challengers.pop(ctx.uid(), None)
+    for c in waiting:
+        if live.recording_count() >= limit:
+            break
         try:
-            live.start_session(current, watch=status, watch_limit=limit)
+            live.start_session(c, watch=c["watch_status"], watch_limit=limit)
+            row = rows[c["id"]]
+            row["reason"] = ("Selected for recording · longest wait" if row["waiting_sec"] >= config.WATCH_FAIR_WAIT_SEC
+                             else "Selected for recording")
         except ValueError as exc:
             message = str(exc)
+            rows[c["id"]]["reason"] = message
             creators.log(c["id"], message)
             discord_clips.event("status", f"{day}:{c['id']}:start:{message}", f"{c['name']}. {message}")
+    _show(rows)
 
 
 def on_clip_ready(job, clip):
