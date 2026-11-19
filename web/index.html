@@ -111,6 +111,7 @@ main{background:var(--bg);margin:8px 8px 8px 0;border-radius:var(--r-lg);height:
 .btn .rdot.on{background:#E5323F;animation:pulse 1.3s infinite}
 /* live stream panel */
 .stream{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(250px,1fr);gap:14px;background:#1E1612;border-radius:16px;padding:12px;margin-bottom:22px;color:#EFE5DE;animation:rise .3s ease both}
+.stream .player.twitch-embed{min-height:300px}
 .stream .player{position:relative;aspect-ratio:16/9;border-radius:10px;overflow:hidden;background:#000}
 .stream iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
 .noembed{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:20px;text-align:center;background:#120D0A;color:#EFE5DE}
@@ -1084,7 +1085,10 @@ const avatarUrl = (c, k) => `/api/creators/${encodeURIComponent(c.id)}/avatar?${
 const fmtK = n => (n = Number(n) || 0) >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M" : n >= 1e3 ? (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K" : String(n);
 function playerSrc(k, e) {
   if (!e) return "";
-  if (k === "twitch") return `https://player.twitch.tv/?channel=${encodeURIComponent(e)}&parent=${location.hostname}&muted=true&autoplay=true`;
+  if (k === "twitch" && /^[a-z0-9_]+$/i.test(e)) {
+    const query = new URLSearchParams({channel:e, parent:location.hostname, muted:"true", autoplay:"true"});
+    return "https://player.twitch.tv/?" + query;
+  }
   if (k === "youtube") return `https://www.youtube-nocookie.com/embed/${encodeURIComponent(e)}?autoplay=1&mute=1&playsinline=1`;
   if (k === "kick") return `https://player.kick.com/${encodeURIComponent(e)}?muted=true&autoplay=true`;
   return "";
@@ -1094,17 +1098,29 @@ function drawStream() {
   const box = $("#stream"); if (!box) return;
   const c = creator(); if (!c) return;
   const on = liveOn(c);
-  if (!on.length) { if (box.innerHTML) box.innerHTML = ""; return; }
+  if (!on.length) {
+    put(box, c.channels?.twitch ? `<div class="row"><a class="btn sm" href="${esc(twitchLink({channel:c.channels.twitch}))}" target="_blank" rel="noopener noreferrer">Open on Twitch ${ic("upright")}</a></div>` : "");
+    return;
+  }
   S.spick = S.spick || {};
   const [k, p] = on.find(([x]) => x === S.spick[c.id]) || on[0];
   if (!box.querySelector(".stream")) box.innerHTML = `<div class="stream"><div class="player"></div><div class="sinfo"></div></div>`;
   const pl = box.querySelector(".player"), src = playerSrc(k, p.embed);
-  if (pl.dataset.src !== src) {           // only swap the player when the stream changes, never on a refresh
-    pl.dataset.src = src;
-    const ipHost = /^[\d.]+$|^\[/.test(location.hostname);
-    pl.innerHTML = k === "twitch" && ipHost
-      ? `<div class="noembed">${platLogo(k)}<b>Twitch only plays inside sites with a web address</b><span>It will play here once PeakCut is on its domain, or open PeakCut at localhost instead of ${esc(location.hostname)}.</span><a class="btn sm" href="${esc(p.channel)}" target="_blank" rel="noopener">Watch on Twitch ${ic("upright")}</a></div>`
-      : src ? `<iframe src="${src}" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen title="${PLAT[k].name} live stream"></iframe>` : "";
+  if (pl.dataset.src !== (src || k)) {           // only swap the player when the stream changes, never on a refresh
+    pl.dataset.src = src || k;
+    pl.classList.remove("twitch-embed");
+    if (k === "twitch") {
+      const narrow = pl.clientWidth < 400;
+      const local = location.hostname === "localhost";
+      const supported = !!src && (local || location.protocol === "https:") && !/^[\d.]+$|^\[/.test(location.hostname);
+      pl.innerHTML = `<div class="noembed">${platLogo(k)}<b>Twitch live preview</b>
+        <span>${!supported ? "This address cannot embed Twitch. A public HTTPS site or localhost is required."
+          : narrow ? "This preview is too narrow for Twitch. Open the stream on Twitch."
+          : "Start the preview here. Twitch may restrict playback based on age, sign-in or browser settings."}</span>
+        ${supported && !narrow ? '<button class="btn sm" data-act="twitch-preview">Start preview</button>' : ""}</div>`;
+    } else {
+      pl.innerHTML = src ? `<iframe src="${src}" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen title="${PLAT[k].name} live stream"></iframe>` : "";
+    }
   }
   const stats = [p.viewers != null ? [fmtK(p.viewers), "watching"] : null, p.started ? [since(p.started), "live for"] : null,
                  p.followers ? [p.followers.split(" ")[0], p.followers.split(" ").slice(1).join(" ")] : null].filter(Boolean);
@@ -1113,11 +1129,37 @@ function drawStream() {
       ${on.length > 1 ? `<div class="splat">${on.map(([x]) => `<button class="${x === k ? "on" : ""}" data-act="spick" data-p="${x}" title="Watch on ${PLAT[x].name}">${PLAT[x].svg}</button>`).join("")}</div>` : ""}</div>
     <h3>${esc(p.title || "Live now")}</h3><p class="by">${esc(p.name || c.name)}</p>
     ${stats.length ? `<div class="sstats">${stats.map(([v, l]) => `<div><b>${esc(v)}</b><span>${esc(l)}</span></div>`).join("")}</div>` : ""}
+    ${k === "twitch" ? `<div class="cta"><a class="btn sm" href="${esc(twitchLink(p))}" target="_blank" rel="noopener noreferrer">Open on Twitch ${ic("upright")}</a>
+      <small>If Twitch stays on “Preparing your stream…”, use this link for sign-in, age checks or browser restrictions. Recording runs separately.</small></div>` : ""}
     <div class="cta">${rec
       ? `<button class="btn danger" data-act="stoplive" data-j="${esc(rec)}">${ic("stop")}Stop recording</button><small>Recording now. Clips appear below as they're made.</small>`
       : `<button class="btn primary" data-act="golive" data-url="${esc(p.channel)}"><span class="rdot"></span>Record this stream</button><small>PeakCut watches it and clips the best moments as they happen.</small>`}</div>`);
 }
-function liveOn(c) { return Object.entries(c.profiles || {}).filter(([k, p]) => p.live && c.channels?.[k] === p.channel).sort(([, p]) => p.channel === c.channel ? -1 : 1); }
+function twitchLink(profile) {
+  if (/^[a-z0-9_]+$/i.test(profile.embed || "")) return "https://www.twitch.tv/" + profile.embed;
+  try {
+    const url = new URL(profile.channel);
+    if (url.protocol === "https:" && ["www.twitch.tv", "twitch.tv"].includes(url.hostname) && /^\/[a-z0-9_]+\/?$/i.test(url.pathname))
+      return url.origin + url.pathname;
+  } catch {}
+  return "https://www.twitch.tv/";
+}
+window.addEventListener("resize", () => {
+  const player = $("#stream .player");
+  if (player?.dataset.src?.startsWith("https://player.twitch.tv/?") && !player.querySelector("iframe")) {
+    delete player.dataset.src;
+    drawStream();
+  }
+});
+function liveOn(c) {
+  const profiles = {...c.profiles}, watch = c.watch_status;
+  const key = watch?.platform?.toLowerCase();
+  if (watch?.state === "live" && PLAT[key] && c.channels?.[key] === c.channel) {
+    profiles[key] = {...profiles[key], ...watch, channel:c.channel, live:true};
+  }
+  return Object.entries(profiles).filter(([k, p]) => p.live && c.channels?.[k] === p.channel)
+    .sort(([, p]) => p.channel === c.channel ? -1 : 1);
+}
 function statusBadge(c) {
   if (c.live_job) return `<span class="sbadge rec"><i></i>Recording</span>`;
   const on = liveOn(c);
@@ -1268,7 +1310,7 @@ function drawShell() {  const nav = (v, icon, label, extra = "") => `<button cla
   const c = creator();
   const recording = S.creators.filter(x => x.live_job).length;
   let title = {overview:"Home", library:"All videos", settings:"Settings", usage:"AI usage", watchlist:"Watchlist"}[S.view] || "", sub = "", act = "";
-  if (S.view === "usage") sub = "What the AI has been used for.";
+  if (S.view === "usage") sub = "Usage, service limits and pending work.";
   if (S.view === "overview") sub = `${greeting()}. ${S.creators.length} creator${S.creators.length === 1 ? "" : "s"}${recording ? `, ${recording} recording now` : ""}.`;
   if (S.view === "library") sub = "Every video and recording, across all creators.";
   if (S.view === "settings") sub = (S.status.accounts === false ? "Your AI key and connected apps." : "Your profile, security and connected apps.");
@@ -1990,6 +2032,10 @@ function drawUsage() {
       <div class="tile"><i>${ic("chart")}</i><b>${fmtK(k.today_tokens)}</b><span>Tokens today</span></div>
       <div class="tile"><i>${ic("scissors")}</i><b>${(k.calls_total || 0).toLocaleString()}</b><span>AI calls in total</span></div>
       <div class="tile"><i>${ic("receipt")}</i><b>${fmtK(k.tokens_total)}</b><span>Tokens in total</span></div></div>
+    ${k.service ? `<div class="card"><h2>AI service since server start</h2>
+      <p class="help">${esc(k.service.model || k.model || "No model")} · ${k.service.successes || 0} successful · ${k.service.rate_errors || 0} HTTP 429 · ${k.service.waiting || 0} waiting · ${k.service.blocked_models || 0} models cooling down</p>
+      <p class="help">${fmtK(k.service.estimated_input_tokens || 0)} estimated input tokens · ${((k.service.queue_wait_ms || 0)/1000).toFixed(1)} s queue wait · ${k.live_render_waiting || 0} live render tasks waiting</p>
+      ${k.service.reason ? `<p class="help">${esc(k.service.reason.replaceAll("_", " "))}${k.service.retry_at ? " · retry after " + new Date(k.service.retry_at * 1000).toLocaleString() : ""}</p>` : ""}</div>` : ""}
     <div class="card"><div class="card-head"><div><h2>Tokens per day</h2><p class="sub">Last 30 days. Your AI provider bills you for these directly.</p></div></div>${tokenChart(k.daily || [])}</div>
     <div class="split">
       <div class="card"><div class="card-head"><div><h2>What it was used for</h2><p class="sub">By kind of AI work, all time</p></div></div>${hbars(k.by_purpose || [])}</div>
@@ -2225,6 +2271,7 @@ function drawWatchlist() {
       <label class="f">Simultaneous recordings<input id="watch-limit" type="number" min="1" max="${settings.ceiling}" value="${settings.limit}" ${settings.ceiling === 0 ? "disabled" : ""}></label>
       <label class="sw"><input type="checkbox" id="watch-buffer" ${settings.buffer ? "checked" : ""}> Save TikTok drafts in Buffer</label>
       <div><button class="btn" data-act="watch-save">Save watchlist settings</button></div>
+      ${S.status.buffer_drafts ? '<div><button class="btn" data-act="buffer-check-channel">Check Buffer connection</button></div>' : ""}
       ${settings.buffer && !S.status.buffer_drafts ? '<p class="help">Set up Buffer on the server before exports can run.</p>' : ""}
       </div>` : ""}</div>`);
   put($("#watch-rows"), rows.length ? `<div class="card scroll"><table class="stack">
@@ -2242,16 +2289,28 @@ function drawWatchlist() {
       const exports = clips.filter(k => k.watch_export?.state === "queued").length;
       const held = clips.filter(k => k.watch_export?.state === "held").length;
       const decision = c.auto_watch ? S.watchDecisions?.[c.id] : null;
+      const record = js.find(j => j.id === c.live_job) || js[0];
+      const recording = record?.recording_quality, phases = record?.pipeline || {};
+      const moments = js.flatMap(j => (j.candidates || []).map(m => ({...m, job:j.id})));
+      const recent = moments.slice(0, 6);
       return `<tr><td class="c-main" data-l="Streamer"><button class="lnk" data-act="go" data-v="c:${esc(c.id)}">${esc(c.name)}</button>
         <span class="sub">Priority ${esc(c.watchlist.priority)}</span></td>
         <td data-l="Stream"><span>${esc(active)} · ${esc(s.platform || Object.keys(c.channels)[0] || "No channel")}</span>
         ${c.auto_watch && s.title ? `<span class="sub">${esc(s.title)}</span>` : ""}
         ${c.auto_watch && s.category ? `<span class="sub">${esc(s.category)}</span>` : ""}
+        ${record ? `<span class="sub">${fmt(record.duration || 0)} recorded${recording?.height ? " · " + recording.width + "×" + recording.height + " · " + (recording.fps || "?") + " fps" : ""}</span>
+          ${recording?.audio_codec ? `<span class="sub">${esc(recording.audio_codec)} · ${recording.audio_hz || "?"} Hz${recording.bitrate ? " · " + (recording.bitrate / 1000000).toFixed(1) + " Mbps" : ""}</span>` : ""}` : ""}
         ${decision ? `<span>${esc(decision.reason)}</span>${decision.factors ? `<details><summary>Selection · ${decision.points} points</summary>
           ${decision.factors.map(([label, points]) => `<div class="sub">${esc(label)} · ${points > 0 ? "+" : ""}${points}</div>`).join("")}
           </details>` : ""}` : ""}</td>
         <td data-l="Highlights and clips"><span>${clips.filter(k => k.score > 0).length} highlights · ${done} ready · ${processing} processing</span>
         ${drafts || exports || sent || held ? `<span class="sub">${drafts} Buffer drafts · ${exports} waiting · ${held} held · ${sent} sent</span>` : ""}
+        ${record ? `<span class="sub">${phases.visual_checks || 0} visual checks · ${phases.transcribe_seconds || 0} s speech · ${phases.visual_seconds || 0} s review · ${phases.render_seconds || 0} s render · ${phases.export_seconds || 0} s export</span>
+          ${phases.candidate_overload || phases.candidate_missing_media ? `<span class="sub">${phases.candidate_overload || 0} missed at capacity · ${phases.candidate_missing_media || 0} missing source footage</span>` : ""}` : ""}
+        ${recent.length ? `<details><summary>${moments.filter(m => m.state === "waiting").length} waiting · ${moments.filter(m => ["accepted","rendered"].includes(m.state)).length} accepted · ${moments.filter(m => m.state === "rejected").length} rejected</summary>
+          ${recent.map(m => `<div class="sub">${fmt(m.start)}–${fmt(m.end)} · ${esc(m.state)} · ${esc(m.signal)}
+          ${m.reason ? `<span>${esc(m.reason)}</span>` : ""}${m.state === "failed" ? ` <button class="btn sm" data-act="candidate-retry" data-j="${esc(m.job)}" data-c="${esc(m.id)}">Retry</button>` : ""}</div>`).join("")}
+          </details>` : ""}
         ${lastError ? `<span class="err">${esc(lastError)}</span>` : ""}</td>
         <td class="c-act"><div class="row"><button class="btn sm" data-act="watch-toggle" data-c="${esc(c.id)}"
           aria-label="${c.auto_watch ? "Disable" : "Enable"} ${esc(c.name)}">${c.auto_watch ? "Disable" : "Enable"}</button>
@@ -2295,7 +2354,7 @@ document.addEventListener("visibilitychange", () => {
   tick();
   if (hiddenAt && Date.now() - hiddenAt > 60000) {   // away a while: jump back to the live moment
     const pl = $("#stream .player"), f = pl?.querySelector("iframe");
-    if (f) { const src = f.src; f.src = "about:blank"; requestAnimationFrame(() => { f.src = src; }); }
+    if (f && !pl.classList.contains("twitch-embed")) { const src = f.src; f.src = "about:blank"; requestAnimationFrame(() => { f.src = src; }); }
   }
   hiddenAt = 0;
 });
@@ -2353,6 +2412,29 @@ document.addEventListener("click", async e => {
   const a = b.dataset.act, d = b.dataset;
   if (b.tagName === "A") e.preventDefault();
   try {
+    if (a === "twitch-preview") {
+      const player = b.closest(".player"), src = player?.dataset.src;
+      if (src?.startsWith("https://player.twitch.tv/?")) {
+        player.classList.add("twitch-embed");
+        const iframe = document.createElement("iframe");
+        iframe.src = src; iframe.title = "Twitch live stream";
+        iframe.allow = "autoplay; fullscreen; picture-in-picture"; iframe.allowFullscreen = true;
+        player.replaceChildren(iframe);
+      }
+      return;
+    }
+    if (a === "buffer-check-channel") {
+      b.disabled = true;
+      try {
+        await send("/api/admin/buffer/check");
+        toast("TikTok channel is available in Buffer.", "ok");
+      } finally { b.disabled = false; }
+      return;
+    }
+    if (a === "candidate-retry") {
+      await send(`/api/jobs/${encodeURIComponent(d.j)}/candidates/${encodeURIComponent(d.c)}/retry`);
+      return tick();
+    }
     if (a === "go") { closePops(); return go(d.v, d.tab); }
     if (a === "aimodels") {
       b.disabled = true;
@@ -2635,7 +2717,7 @@ $("#main").addEventListener("scroll", () => $(".topbar").classList.toggle("stuck
   loop();
   if (S.status.tour && !$("#formdlg").open) setTimeout(startTour, 500);   // once, the first time someone signs in
   checkNew(true);
-  setInterval(async () => { try { S.status = await api("/api/status"); drawShell(); if (S.view === "overview") drawOverview(); checkNew(); } catch {} }, 15000);
+  setInterval(async () => { try { S.status = await api("/api/status"); drawShell(); if (S.view === "overview") drawOverview(); if (S.view === "usage") await loadUsage(); checkNew(); } catch {} }, 15000);
 })();
 </script>
 </body>

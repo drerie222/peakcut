@@ -20,10 +20,11 @@ def main(root):
     started = time.monotonic()
     db.init()
     source = root / "synthetic-gaming.mp4"
-    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=12",
+    input_video = "testsrc2=s=1920x1080:r=60" if os.environ.get("PEAKCUT_BENCH_1080P60") == "1" else "testsrc2=s=640x360:r=12"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", input_video,
                     "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-stream_loop", "-1", "-i", str(speech),
                     "-map", "0:v", "-map", "1:a", "-map", "2:a", "-t", "66", "-c:v", "libx264", "-threads", "1",
-                    "-preset", "ultrafast", "-c:a", "aac", str(source)], timeout=90, check=True)
+                    "-preset", "ultrafast", "-c:a", "aac", str(source)], timeout=180, check=True)
     with ctx.as_user("benchmark"):
         job = jobs.create({"type": "file", "name": "Synthetic GTA VI fixture", "path": str(source)},
                           {"max_clips": 1, "min_len": 50, "max_len": 61, "layout": "gameplay"}, enqueue=False)
@@ -38,7 +39,7 @@ def main(root):
     assert clip["speech_source"] == "isolated_mic"
     assert not (Path(job["dir"]) / "audio.wav").exists()
     result = {"elapsed_s": round(time.monotonic() - started, 1), "input_s": 66, "output": output,
-              "words": job["word_count"], "draft_hold_reasons": clip["quality"]["issues"],
+              "words": job["word_count"], "source_quality": media.recording_quality(source), "draft_hold_reasons": clip["quality"]["issues"],
               "process_address_space_bytes": resource.getrlimit(resource.RLIMIT_AS)[0],
               "parent_peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
               "child_peak_rss_kib": resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss}

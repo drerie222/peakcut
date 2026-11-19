@@ -118,6 +118,8 @@ def _request(key, query, variables, *, mutation=False):
             raise Error(502, "Buffer could not find this channel. Check BUFFER_TIKTOK_CHANNEL_ID.")
         if reply.is_success and not errors and isinstance(data, dict):
             return data
+        if not mutation and reply.status_code >= 500:
+            raise Error(503, "Buffer's read API is temporarily unavailable. Try again shortly.")
         raise Error(502, _UNCERTAIN if mutation else "Buffer could not check the channel.", uncertain=mutation)
 
 
@@ -227,6 +229,18 @@ def review_issues(job, clip, path=None):
     return quality.review(path, clip, version)["issues"]
 
 
+def check_channel():
+    key, channel_id = config.buffer_api_key(), config.BUFFER_TIKTOK_CHANNEL_ID
+    if not key or not channel_id:
+        raise Error(503, "Set BUFFER_API_KEY and BUFFER_TIKTOK_CHANNEL_ID to enable Buffer drafts.")
+    channel = _request(key, _CHANNEL, {"id": channel_id}).get("channel")
+    if not isinstance(channel, dict) or channel.get("id") != channel_id or channel.get("service") != "tiktok":
+        raise Error(400, "BUFFER_TIKTOK_CHANNEL_ID must be the ID of a TikTok channel in Buffer.")
+    if channel.get("isDisconnected") is not False or channel.get("isLocked") is not False:
+        raise Error(400, "The TikTok channel is disconnected or locked in Buffer.")
+    return {"ready": True}
+
+
 def create(job, clip, title=None, description=None):
     key, channel_id = config.buffer_api_key(), config.BUFFER_TIKTOK_CHANNEL_ID
     if not config.ACCOUNTS:
@@ -250,11 +264,7 @@ def create(job, clip, title=None, description=None):
     if issues:
         raise Error(409, "Buffer draft held. " + " ".join(issues))
 
-    channel = _request(key, _CHANNEL, {"id": channel_id}).get("channel")
-    if not isinstance(channel, dict) or channel.get("id") != channel_id or channel.get("service") != "tiktok":
-        raise Error(400, "BUFFER_TIKTOK_CHANNEL_ID must be the ID of a TikTok channel in Buffer.")
-    if channel.get("isDisconnected") is not False or channel.get("isLocked") is not False:
-        raise Error(400, "The TikTok channel is disconnected or locked in Buffer.")
+    check_channel()
     token = secrets.token_urlsafe(32)
     if clip.get("version", 0) != version or not _clip_file(job, clip):
         raise Error(409, "The clip changed. Open the finished clip and try again.")
