@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from . import ai, config, games, usage, roman
+from . import ai, ai_limits, config, games, usage, roman
 
 WINDOW_SEC, OVERLAP_SEC = 15 * 60, 60
 
@@ -181,26 +181,25 @@ def loud_zscore(db):
 
 
 def ask_ai(prompt, schema=None, purpose="AI call", timeout=None):
-    """Try each model in order, with a couple of retries for rate limits and overloads.
-    Returns (the answer, the model that gave it, tokens used) and notes the tokens in the usage record."""
+    """Try explicitly configured models in order under the shared request policy."""
     if not config.ai_ready():
         raise RuntimeError("The AI is not set up on this server.")
-    last = None
+    last, deferred = None, []
     for model in ai.models():
-        for attempt in range(3):
-            try:
-                out, sent, wrote = ai.call(model, prompt, schema or SCHEMA, timeout)
+        try:
+            out, sent, wrote = ai.call(model, prompt, schema or SCHEMA, timeout)
+            if sent or wrote:
                 usage.record(sent, wrote, purpose)
-                ai.clear_problem()
-                return out, model, sent + wrote
-            except Exception as e:  # noqa: BLE001
-                last = e
-                if "HTTP 429" in str(e) or "HTTP 5" in str(e):
-                    time.sleep(4 * (attempt + 1))
-                    continue
-                break
+            ai.clear_problem()
+            return out, model, sent + wrote
+        except ai_limits.Deferred as exc:
+            deferred.append(exc)
+        except Exception as exc:  # providers can return invalid content
+            last = exc
+    if deferred:
+        raise min(deferred, key=lambda exc: exc.retry_at)
     ai.note_problem(last)
-    raise RuntimeError(f"The AI did not answer: {ai.explain(last) or last}")
+    raise RuntimeError(f"The AI did not answer: {ai.explain(last) or 'No usable response.'}")
 
 
 def sentence_ends(words) -> list:

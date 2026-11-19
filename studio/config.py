@@ -218,6 +218,16 @@ ALLOWED_SITES = tuple(s.strip().lower() for s in env(
 
 # ---------------------------------------------------------------- AI (bring your own key: see studio/ai.py)
 # These are the starting values. Whatever is saved from the dashboard (Settings, AI) is used instead.
+AI_RPM = max(0, int(env("PEAKCUT_AI_RPM", "5")))
+AI_TPM = max(0, int(env("PEAKCUT_AI_TPM", "0")))
+AI_RPD = max(0, int(env("PEAKCUT_AI_RPD", "0")))
+AI_MAX_WAITERS = max(1, int(env("PEAKCUT_AI_MAX_WAITERS", "8")))
+AI_LIMIT_ALL = env("PEAKCUT_AI_LIMIT_ALL", "0") == "1"
+LIVE_HEIGHT = min(1080, max(144, int(env("PEAKCUT_LIVE_HEIGHT", "1080"))))
+LIVE_FPS = min(60, max(15, int(env("PEAKCUT_LIVE_FPS", "60"))))
+LIVE_STALL_SECONDS = max(20, int(env("PEAKCUT_LIVE_STALL_SECONDS", "45")))
+LIVE_CANDIDATES = max(1, int(env("PEAKCUT_LIVE_CANDIDATES", "16")))
+LIVE_CANDIDATE_HOURS = max(1, float(env("PEAKCUT_LIVE_CANDIDATE_HOURS", "30")))
 AI_PROVIDER = env("PEAKCUT_AI_PROVIDER", "gemini").strip().lower()            # gemini, openai, xai, groq, openrouter, anthropic, ollama, custom
 AI_MODELS = [m.strip() for m in env("PEAKCUT_AI_MODELS", "").split(",") if m.strip()]   # tried in this order
 AI_BASE_URL = env("PEAKCUT_AI_BASE_URL", "").rstrip("/")                      # only for "custom", or to override a provider's address
