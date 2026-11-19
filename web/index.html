@@ -1099,7 +1099,8 @@ function drawStream() {
   const c = creator(); if (!c) return;
   const on = liveOn(c);
   if (!on.length) {
-    put(box, c.channels?.twitch ? `<div class="row"><a class="btn sm" href="${esc(twitchLink({channel:c.channels.twitch}))}" target="_blank" rel="noopener noreferrer">Open on Twitch ${ic("upright")}</a></div>` : "");
+    const fallback = c.channels?.twitch ? `<div class="row"><a class="btn sm" href="${esc(twitchLink({channel:c.channels.twitch}))}" target="_blank" rel="noopener noreferrer">Open on Twitch ${ic("upright")}</a></div>` : "";
+    if (box.innerHTML !== fallback) box.innerHTML = fallback;
     return;
   }
   S.spick = S.spick || {};
@@ -1155,7 +1156,7 @@ function liveOn(c) {
   const profiles = {...c.profiles}, watch = c.watch_status;
   const key = watch?.platform?.toLowerCase();
   if (watch?.state === "live" && PLAT[key] && c.channels?.[key] === c.channel) {
-    profiles[key] = {...profiles[key], ...watch, channel:c.channel, live:true};
+    profiles[key] = {...profiles[key], ...watch, embed:watch.embed || profiles[key]?.embed, channel:c.channel, live:true};
   }
   return Object.entries(profiles).filter(([k, p]) => p.live && c.channels?.[k] === p.channel)
     .sort(([, p]) => p.channel === c.channel ? -1 : 1);

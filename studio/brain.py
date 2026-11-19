@@ -185,9 +185,14 @@ def ask_ai(prompt, schema=None, purpose="AI call", timeout=None):
     if not config.ai_ready():
         raise RuntimeError("The AI is not set up on this server.")
     last, deferred = None, []
+    deadline = time.monotonic() + timeout if timeout else None
     for model in ai.models():
+        remaining = deadline - time.monotonic() if deadline is not None else None
+        if remaining is not None and remaining <= 0:
+            deferred.append(ai_limits.Deferred("text_deadline", time.time() + 20))
+            break
         try:
-            out, sent, wrote = ai.call(model, prompt, schema or SCHEMA, timeout)
+            out, sent, wrote = ai.call(model, prompt, schema or SCHEMA, remaining)
             if sent or wrote:
                 usage.record(sent, wrote, purpose)
             ai.clear_problem()

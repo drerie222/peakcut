@@ -369,9 +369,14 @@ def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, i
     if not ready() or not image or not models():
         return "", 0, 0
     errors = []
+    deadline = time.monotonic() + (timeout or 20)
     for model in models():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            errors.append(ai_limits.Deferred("vision_deadline", time.time() + 20))
+            break
         try:
-            result = _cached(model, prompt, image, lambda: _see(model, prompt, image, timeout))
+            result = _cached(model, prompt, image, lambda: _see(model, prompt, image, remaining))
             clear_problem()
             return result
         except (AIError, ai_limits.Deferred) as exc:

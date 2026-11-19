@@ -156,9 +156,13 @@ class Limiter:
         for attempt in range(2):
             self._admit(provider, scope, estimated, start, start + 4)
             try:
+                possibly_sent = False
                 try:
                     response = send()
-                except (httpx.TimeoutException, httpx.NetworkError):
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                    response = None
+                except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+                    possibly_sent = True
                     response = None
                 now = time.time()
                 with self.cv:
@@ -172,7 +176,7 @@ class Limiter:
                         return response
                     self.counts["rate_errors" if status == 429 else "transient_errors"] += 1
                     self.failures[scope] += 1
-                    reason, delay = classify(response, now) if response is not None else ("transient", 0)
+                    reason, delay = classify(response, now) if response is not None else ("transient", 15 if possibly_sent else 0)
                     if status != 429:
                         reason = "transient"
                     backoff = min(120., 2 ** min(7, self.failures[scope])) + random.uniform(0, 1)
