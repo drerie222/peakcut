@@ -13,7 +13,7 @@ import httpx
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
 
-from . import config, ctx, db, jobs
+from . import config, ctx, db, jobs, quality, speaker
 
 _API = "https://api.buffer.com"
 _CHANNEL = """query TikTokChannel($id: ChannelId!) {
@@ -214,6 +214,19 @@ def _caption(clip, title, description):
     return text
 
 
+def review_issues(job, clip, path=None):
+    version = clip.get("version", 0)
+    result = clip.get("quality") or {}
+    if result.get("version") == version and result.get("revision") == quality.REVIEW_REVISION:
+        return result["issues"]
+    if speaker.protected(job, clip):
+        return ["This gameplay clip predates the speech and picture checks. Re-make it from the original to export."]
+    path = path or _clip_file(job, clip)
+    if not path:
+        return ["The finished video could not be read."]
+    return quality.review(path, clip, version)["issues"]
+
+
 def create(job, clip, title=None, description=None):
     key, channel_id = config.buffer_api_key(), config.BUFFER_TIKTOK_CHANNEL_ID
     if not config.ACCOUNTS:
@@ -223,7 +236,8 @@ def create(job, clip, title=None, description=None):
     base = _public_base()
     if not base:
         raise Error(400, "Set PEAKCUT_PUBLIC_URL to the public HTTPS address Buffer can use to fetch the video.")
-    if not _clip_file(job, clip):
+    path = _clip_file(job, clip)
+    if not path:
         raise Error(409, "Wait until the clip has finished rendering.")
     version = clip.get("version", 0)
     text = _caption(clip, title, description)
@@ -232,6 +246,9 @@ def create(job, clip, title=None, description=None):
         existing = cn.execute(sa.select(_table).where(match)).first()
     if existing:
         return _existing_draft(existing, clip)
+    issues = review_issues(job, clip, path)
+    if issues:
+        raise Error(409, "Buffer draft held. " + " ".join(issues))
 
     channel = _request(key, _CHANNEL, {"id": channel_id}).get("channel")
     if not isinstance(channel, dict) or channel.get("id") != channel_id or channel.get("service") != "tiktok":

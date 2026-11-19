@@ -11,7 +11,7 @@ import traceback
 import uuid
 from pathlib import Path
 
-from . import brain, config, creators, ctx, facecam, games, load, media, quality, render, roman, safe, transcribe, usage
+from . import brain, config, creators, ctx, facecam, games, load, media, quality, render, roman, safe, speaker, transcribe, usage
 
 class _FairQueue:
     """Whose video is next. Each person has their own line and the lines take turns, so someone who adds ten
@@ -231,7 +231,8 @@ def _load_file(f: Path, uid: str):
             elif job.get("kind") == "live" and c.get("src") and Path(c["src"]).is_file():
                 c["status"] = "queued"
                 job.setdefault("remake", []).append(c["id"])
-            elif job.get("kind") != "live" and (f.parent / "words.json").is_file():
+            elif job.get("kind") != "live" and ((f.parent / "words.json").is_file()
+                                                or speaker.protected(job, c)):
                 c["status"] = "queued"  # a single clip being re-made: jobs.start() makes it again
                 job.setdefault("remake", []).append(c["id"])
             else:
@@ -301,6 +302,8 @@ def create(source: dict, options: dict, enqueue=True, creator=None, kind="video"
     job = {"id": jid, "user": ctx.uid(), "kind": kind, "creator": creator, "dir": str(d), "created": time.time(), "source": source,
            "options": opts, "status": "queued", "stage": "Waiting", "progress": 0.0,
            "title": source.get("name", ""), "uploader": "", "duration": 0, "clips": [], "error": None, "ai": {}}
+    if c:
+        job["game_mic_track"] = c.get("game_mic_track", 0)
     d.mkdir(parents=True)
     with _lock:
         _jobs[jid] = job
@@ -389,7 +392,7 @@ def _request_render(jid, cid, changes):
     _q.put(("clip", jid, cid))
 
 
-def render_one(job, clip, words):
+def render_one(job, clip, words, *, verified_mic=False):
     d = Path(job["dir"])
     clip["status"] = "rendering"
     save(job)
@@ -401,10 +404,39 @@ def render_one(job, clip, words):
         src = Path(clip["src"]) if clip.get("src") else Path(job["source_path"])
         if not clip.get("src"):
             clip["end"] = min(clip["end"], job["duration"])
+        gameplay = speaker.protected(job, clip)
+        source_issue = None
+        clip.pop("trimmed_opening", None)
+        if gameplay:
+            clip["gameplay_source"] = True
+            source_issue = _prepare_gameplay(job, clip, src, off)
+            info = media.probe(src)
+            width, height = info["width"], info["height"]
+            old_crop = clip.get("version", 0) and not clip.get("quality")
+            if clip.get("layout") == "gameplay" and (old_crop or not (clip.get("facecam") or clip.get("facecam_checked"))):
+                clip.pop("facecam", None)
+                box = _facecam(job, src)
+                if box:
+                    clip["facecam"] = box
+                clip["facecam_checked"] = True
+            if not clip.get("captions", True):
+                words, clip["speech_source"] = [], "disabled"
+            elif verified_mic and not clip.get("src"):
+                clip["speech_source"] = "isolated_mic"
+            else:
+                words, clip["speech_source"] = speaker.captions(job, clip, src, off)
+            clip["hook"] = speaker.hook(clip)
+            clip["highlight_words"] = []   # a visual description must not highlight words from the programme mix
+        else:
+            width, height = job["width"], job["height"]
         local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
         near = _caption_words(job, clip, words, off) if clip.get("captions", True) else []
-        out = render.render_clip(src, d / "clips", clip["id"], local, near, job["width"], job["height"])
-        clip.update(out, status="done", version=clip.get("version", 0) + 1, error=None)
+        out = render.render_clip(src, d / "clips", clip["id"], local, near, width, height)
+        version = clip.get("version", 0) + 1
+        if gameplay:
+            clip["quality"] = quality.review(d / "clips" / out["file"], clip, version, gameplay=True,
+                                             source_issue=source_issue or quality.gameplay_issue(src, clip, off))
+        clip.update(out, status="done", version=version, error=None)
         post = {k: clip[k] for k in ("title", "description", "hashtags", "hook", "start", "end", "score")}
         (d / "clips" / f"{clip['id']}.json").write_text(json.dumps(post, indent=1), encoding="utf-8")
         if clip["version"] == 1:
@@ -416,14 +448,47 @@ def render_one(job, clip, words):
                     fn(job, clip)
                 except Exception:  # noqa: BLE001
                     traceback.print_exc()
+        elif job.get("watch_broadcast"):
+            from . import watchlist
+            watchlist.on_clip_ready(job, clip)
     except Exception as e:  # noqa: BLE001
         clip.update(status="error", error=safe.friendly(e, 400))
         creators.log(job["creator"], f"Clip failed: {safe.friendly(e, 200)}")
     save(job)
 
 
+def _prepare_gameplay(job, clip, src, offset):
+    span = clip["end"] - clip["start"]
+    advance = quality.opening(src, clip["start"] - offset, span)
+    if advance is None:
+        return "No clear video was found at the start of the selected cut."
+    if advance:
+        cut = round(clip["start"] + advance, 2)
+        if clip["end"] - cut < 3 or cut >= clip.get("peak_sec", clip["end"]):
+            return "Clearing the black opening would remove the payoff or leave too little video."
+        clip.update(start=cut, trimmed_opening=round(advance, 2))
+    if clip.get("evidence") == "audio_only" and config.ai_ready():
+        peak = clip["peak_sec"]
+        start, end = clip["start"], clip["end"]
+        try:
+            jpeg = facecam.frame_strip([(src, offset, end)], (max(start, peak - 4), peak, min(end - 0.25, peak + 4)))
+            found, _ = brain.judge_gameplay(jpeg, start, end, job["title"], job.get("game"), config.LIVE_AI_TIMEOUT)
+        except Exception:  # an optional visual check cannot make the local clip fail
+            found = None
+        if found:
+            clip.update(found, evidence="visual")
+    return None
+
+
 def _caption_words(job, clip, words, off):
     span = [round(clip["start"], 2), round(clip["end"], 2), "en2"]      # "en2": captions made always-English
+    isolated = speaker.protected(job, clip)
+    if isolated and not words:
+        clip.pop("fixed_for", None)
+        clip.pop("fixed_words", None)
+        return []
+    if isolated:
+        span[2] = "isolated-mic-v1"
     if clip.get("fixed_for") == span and clip.get("fixed_words") and not any(
             roman.needs_roman(w.get("w", "")) for w in clip["fixed_words"]):
         raw = clip["fixed_words"]          # already tidied for this exact span: no second AI call
@@ -433,7 +498,7 @@ def _caption_words(job, clip, words, off):
             usage.set_context(job.get("creator"), job.get("title") or "")
             lang = job.get("lang") or ("the stream's language" if job.get("watch_broadcast") else "")
             raw = brain.english_captions(raw, lang, job.get("title") or "",
-                                         youtube_english=lambda: _english_part(job, clip))
+                                         youtube_english=None if isolated else lambda: _english_part(job, clip))
             clip.update(fixed_words=raw, fixed_for=span)
         except Exception:  # noqa: BLE001 - captions still render with the words as heard
             pass
@@ -544,14 +609,14 @@ def _covers(words: list, start: float, end: float) -> bool:
     return len(inside) >= 25 * minutes and inside[-1]["s"] >= start + 0.85 * (end - start)
 
 
-def _facecam(job) -> list | None:
+def _facecam(job, path=None) -> list | None:
     """Where the webcam is in the source: once for the whole video, for every clip of it.
 
     Only a sure answer is used. A box that is a scoreboard drawn over the game would
     put a picture of a scoreboard in the corner of the clip. One frame is also shown to
     the AI, which tells a person from a game character better than any measurement can;
     what it says is measured again on the picture, so it cannot do any harm."""
-    path = job.get("source_path")
+    path = path or job.get("source_path")
     if not path or not Path(path).is_file():
         return None
     try:
@@ -586,16 +651,11 @@ def _run_job(job):
     notes = []
     face = False       # where the webcam is in the source, found once; False means not looked for yet
     usage.set_context(job["creator"], job["title"] or src.get("name"))
-    resuming = bool(job.pop("resume", False)) and (d / "words.json").is_file()
+    resuming = bool(job.pop("resume", False))
     if resuming:   # after a restart: keep the transcript parts, clips and AI answers already made, and carry on
         _set(job, status="running", stage="Picking up where it stopped", error=None)
     else:
         _set(job, status="running", stage="Getting the audio", progress=0.03, error=None, clips=[], ai={}, done_blocks=0)
-    if not transcribe.model_ready() and not transcribe.REMOTE:
-        from . import fetch_model
-        _set(job, stage="Getting the speech model (one time, about 480 MB)")
-        fetch_model.ensure()
-        _set(job, stage="Getting the audio")
     fetch = ThreadPoolExecutor(1)
     video = None
     if src["type"] == "url":
@@ -608,6 +668,10 @@ def _run_job(job):
             raise RuntimeError("This link is a live stream, so it would never finish downloading. Open the creator, "
                                "put this link under Setup, and press Start recording instead.")
         _set(job, title=meta["title"], uploader=meta["uploader"], duration=meta["duration"])
+        if not game:
+            game = games.detect(meta["title"])[0] or ""
+            if game:
+                job["game"] = game
         if not job.get("thumb") and media.save_thumb(d, url=src["url"]):
             _set(job, thumb=True)
         usage.set_context(job["creator"], meta["title"])
@@ -624,14 +688,28 @@ def _run_job(job):
         _set(job, source_path=str(audio_file), width=info["width"], height=info["height"], duration=info["duration"])
         if not job.get("thumb") and media.save_thumb(d, video=audio_file):
             _set(job, thumb=True)
+    gameplay = speaker.protected(job, o)
+    mic = speaker.declared_track(job.get("game_mic_track")) if gameplay and src["type"] == "file" else None
     wav = d / "audio.wav"
     try:
-        media.extract_audio(audio_file, wav)
+        if mic:
+            try:
+                media.extract_audio(audio_file, wav, track=mic)
+            except RuntimeError:
+                mic = None
+        if not mic:
+            media.extract_audio(audio_file, wav)
         audio = media.load_audio(wav)
     finally:
         wav.unlink(missing_ok=True)
         if src["type"] == "url":
             audio_file.unlink(missing_ok=True)
+    speech = not gameplay or bool(mic)
+    transcript = d / (f"mic-{mic}-words.json" if mic else "words.json")
+    if speech and not transcribe.model_ready() and not transcribe.REMOTE:
+        from . import fetch_model
+        _set(job, stage="Getting the speech model (one time, about 480 MB)")
+        fetch_model.ensure()
     if not job["duration"]:
         job["duration"] = len(audio) / 16000
     lo = int((o["range_start"] or 0) * 16000)
@@ -681,7 +759,7 @@ def _run_job(job):
                 exact[clip["id"]] = (a0 / 16000, b0 / 16000, tw)
                 words_now = tw
         if clip["status"] != "error":
-            render_one(job, clip, words_now)
+            render_one(job, clip, words_now, verified_mic=bool(mic))
 
     cpus = os.cpu_count() or 4
     renders = None if config.LOW_RESOURCE else ThreadPoolExecutor(2 if cpus < 8 else min(6, cpus // 6))
@@ -698,7 +776,7 @@ def _run_job(job):
     words, tokens, model = [], 0, None
     done_blocks = 0
     yt = None
-    if src["type"] == "url" and config.YT_TRANSCRIPT and media.is_youtube(src["url"]):
+    if not gameplay and src["type"] == "url" and config.YT_TRANSCRIPT and media.is_youtube(src["url"]):
         try:
             yt = media.youtube_words(src["url"])
         except Exception:  # noqa: BLE001 - no transcript to borrow: ours is written as usual
@@ -709,10 +787,10 @@ def _run_job(job):
         job["lang"] = yt[1] if yt else ""          # the language spoken, when YouTube says (decides the captions)
     if resuming:
         try:
-            words = json.loads((d / "words.json").read_text(encoding="utf-8"))
-        except ValueError:
+            words = json.loads(transcript.read_text(encoding="utf-8")) if speech else []
+        except (OSError, ValueError):
             words = []
-        done_blocks = min(int(job.get("done_blocks", 0)), len(blocks)) if words else 0
+        done_blocks = min(int(job.get("done_blocks", 0)), len(blocks)) if words or not speech else 0
         tokens, model = int((job.get("ai") or {}).get("tokens", 0)), (job.get("ai") or {}).get("model")
         if done_blocks < len(blocks):     # words past the last finished part are transcribed again
             cut = blocks[done_blocks][0] / 16000
@@ -746,7 +824,10 @@ def _run_job(job):
             continue                      # transcribed and checked by the AI before the restart
         shift = a / 16000
         where = f" (minute {round((a - lo) / 16000 / 60)} of {round(span / 60)})" if len(blocks) > 1 else ""
-        if yt:
+        if not speech:
+            _set(job, stage="Checking gameplay audio levels" + where)
+            bw = []
+        elif yt:
             _set(job, stage="Reading the transcript" + where)
             bw = [dict(w, s=round(w["s"] - shift, 2), e=round(w["e"] - shift, 2)) for w in yt[0] if a / 16000 <= w["s"] < b / 16000]
         else:
@@ -758,17 +839,24 @@ def _run_job(job):
             bw = heard.pop(bi).result()
         _set(job, progress=max(job["progress"], 0.14 + 0.78 * (b - lo) / max(1, hi - lo)))
         words += [dict(w, s=round(w["s"] + shift, 2), e=round(w["e"] + shift, 2)) for w in bw]
-        (d / "words.json").write_text(json.dumps(words), encoding="utf-8")
+        if speech:
+            transcript.write_text(json.dumps(words), encoding="utf-8")
         _set(job, stage="Finding the best moments" + where, word_count=len(words))
         left = int(o["max_clips"]) - len(job["clips"])
-        if left <= 0 or len(bw) < 8:
+        if left <= 0 or (not gameplay and len(bw) < 8):
             job["done_blocks"] = bi + 1
             save(job)
             continue
         quota = max(1, math.ceil(left / (len(blocks) - bi)))
         s0 = int((a - lo) / 16000)
-        found, ai = brain.find_clips(bw, db[s0: s0 + int((b - a) / 16000) + 1], (b - a) / 16000, job["title"],
-                                     job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), notes.append, game=game)
+        length = (b - a) / 16000
+        levels = db[s0: s0 + int(length) + 1]
+        if gameplay and len(bw) < 8:
+            found = brain.gameplay_candidates(levels, length, quota, int(o["min_len"]), int(o["max_len"]))
+            ai = {"note": "Mixed gameplay audio is used only to locate peaks for visual review."} if not speech else {}
+        else:
+            found, ai = brain.find_clips(bw, levels, length, job["title"], job["uploader"], quota,
+                                         int(o["min_len"]), int(o["max_len"]), notes.append, game=game)
         tokens += ai.get("tokens", 0)
         model = ai.get("model") or model
         if ai.get("note"):
@@ -790,12 +878,18 @@ def _run_job(job):
             c.update(id=f"clip{len(job['clips']) + 1:02d}", start=round(c["start"] + shift, 2),
                      end=round(c["end"] + shift, 2), style=o["style"], layout=o["layout"],
                      captions=o.get("captions", True), status="queued", version=0)
+            if "peak_sec" in c:
+                c["peak_sec"] = round(c["peak_sec"] + shift, 2)
+            if mic:
+                c.setdefault("evidence", "isolated_mic")
             # Only the gameplay layout uses a webcam, so it is only looked for then, and only once: a
             # stream with no webcam is not looked for again on every clip of it.
             if o["layout"] == "gameplay" and face is False:
                 face = _facecam(job)
             if face:
                 c["facecam"] = face
+            if o["layout"] == "gameplay" and face is not False:
+                c["facecam_checked"] = True
             job["clips"].append(c)
             block_clips.append(c)
         job["ai"] = {"model": model, "tokens": tokens, "note": "", "log": notes[-5:]}
@@ -810,7 +904,7 @@ def _run_job(job):
         for a_s, b_s, tw in exact.values():
             words = [w for w in words if not a_s <= w["s"] < b_s] + tw
         words.sort(key=lambda w: w["s"])
-        (d / "words.json").write_text(json.dumps(words), encoding="utf-8")
+        transcript.write_text(json.dumps(words), encoding="utf-8")
     if renders is not None:
         renders.shutdown(wait=False)
     ahead.shutdown(wait=False)
@@ -853,7 +947,7 @@ def _worker(quick_only=False):
                 clip = next(c for c in job["clips"] if c["id"] == cid)
                 words = []
                 transcript = Path(job["dir"]) / "words.json"
-                if clip.get("captions", True) and transcript.is_file():
+                if clip.get("captions", True) and not speaker.protected(job, clip) and transcript.is_file():
                     words = json.loads(transcript.read_text(encoding="utf-8"))
                 render_one(job, clip, words)
         except Exception as e:  # noqa: BLE001

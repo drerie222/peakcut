@@ -20,7 +20,7 @@ import httpx
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from studio import accounts, auth, brain, buffer, config, creators, ctx, db, discord_clips, facecam
-from studio import jobs, live, load, media, posting, profiles, render, server, watchlist
+from studio import jobs, live, load, media, posting, profiles, render, server, transcribe, watchlist
 
 ORIGIN = {"Origin": BASE}
 FEEDS = {"live": "/sim-live", "status": "/sim-status", "clips": "/sim-clips"}
@@ -127,8 +127,9 @@ def gaming_fixture(path):
                     "-f", "lavfi", "-i", "color=c=0xDD9966:s=152x88:r=8",
                     "-f", "lavfi", "-i", "color=c=0x40AAF0:s=84x32:r=8",
                     "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+                    "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000",
                     "-filter_complex", "[0:v][1:v]overlay=0:0[base];[base][2:v]overlay=x='40+mod(t*42,460)':y=284[v]",
-                    "-map", "[v]", "-map", "3:a",
+                    "-map", "[v]", "-map", "3:a", "-map", "4:a",
                     "-t", "66", "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2", "-c:a", "aac", str(path)],
                    check=True, timeout=60)
 
@@ -138,13 +139,14 @@ def test_render_and_export(owner, job):
     gaming_fixture(path)
     clip = dict(id="racing-highlight", status="queued", start=2, end=63, score=95, title="The final stunt",
                 description="An unexpected racing finish.", hashtags=["GTA6"], hook="THE FINAL STUNT",
-                layout="gameplay", captions=True, style="classic", src=str(path), src_offset=0)
+                layout="gameplay", captions=True, style="classic", src=str(path), src_offset=0, mic_track=2, evidence="visual")
     job.update(width=640, height=360, title="GTA road race")
     job["clips"].append(clip)
     words = [{"s": 30, "e": 31, "w": "What"}, {"s": 31, "e": 31.5, "w": "a"}, {"s": 31.5, "e": 32, "w": "stunt!"}]
     jpeg = facecam.frame_strip([(path, 0, 66)], (10, 30, 40))
     check("the visual judge gets a contact sheet from real video frames", jpeg[:2] == b"\xff\xd8")
-    with patch.object(brain.ai, "see", return_value=('{"title":"The final stunt","score":95,"category":"clutch"}', 0, 0)):
+    with patch.object(brain.ai, "see", return_value=(
+            '{"title":"The final stunt","score":95,"category":"clutch","reason":"A car clears the gap."}', 0, 0)):
         c, _ = brain.judge_gameplay(jpeg, 2, 63, job["title"], "gta6")
         check("the visual judge can return a scored 61-second GTA highlight", c["score"] == 95 and c["end"] - c["start"] == 61)
         s = live.SESSIONS[job["id"]]
@@ -157,6 +159,7 @@ def test_render_and_export(owner, job):
     if face:
         clip["facecam"] = [face[k] for k in ("x", "y", "w", "h")]
     with (ctx.as_user(owner.id), patch.object(config, "OUT_FPS", 8), patch.object(render, "_qsv_ok", False),
+          patch.object(transcribe, "transcribe", return_value=words),
           patch.object(brain, "translate_caption_words", return_value=words) as translate,
           patch.object(jobs, "on_clip_ready", [watchlist.on_clip_ready, discord_clips.enqueue, posting.on_clip_ready]),
           patch.object(discord_clips, "_WEBHOOK_PATH", FEEDS["clips"]), patch.object(posting, "enqueue") as publish):

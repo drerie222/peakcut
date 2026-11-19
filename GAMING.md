@@ -70,9 +70,8 @@ A gaming stream is a 16:9 game with a small webcam picture in one corner. PeakCu
 below — fine for a talking head, poor for a game, where the play is a thin strip
 of the picture.
 
-The new **gameplay** layout fills the 1080x1920 frame with the game (centre
-cropped, the same as "Fill screen") and puts the webcam in the top corner of it,
-so the viewer sees the play and the face at once.
+The **gameplay** layout fits the full game into the 1080x1920 frame so edge HUDs remain visible. A detected
+webcam is enlarged in its own area above the game. The opening hook and captions have separate positions.
 
 To do that, PeakCut has to know where the webcam is. `studio/facecam.py` finds it
 by the one thing a webcam always has and a game almost never has: **a straight
@@ -102,14 +101,13 @@ of the measured rectangles is the webcam, and if it matches none of them its own
 is put onto the real borders and checked like any other candidate. A model that
 only reads text, a service that refuses pictures, or an answer that is nonsense all
 leave the measurement alone. If the model looks and says there is no webcam, that is
-believed: a stream with no webcam is cropped, which still looks right.
+believed: a stream with no webcam keeps its full gameplay view without an inset.
 
 That one frame is a small JPEG of the stream, and it goes to the AI service you
 configured, the same service the transcript already goes to. With no AI set, no
 picture leaves the machine and the borders are measured on their own.
 
-Only a sure answer is used. If the webcam is not found, the layout falls back to
-"Fill screen", which is still the right shape for a game.
+Only a sure answer is used. The crop leaves space around that box while staying inside the source.
 
 | | |
 |---|---|
@@ -184,12 +182,10 @@ slot, a waiting streamer gets a turn after 60 minutes by default. Earlier switch
 minimum recording time and cooldown. A failed start can be retried up to three times per broadcast. Disabling
 a streamer stops that streamer's watchlist recording. See the [Hetzner operating profile](HETZNER.md).
 
-The watchlist uses the live transcript and the existing loudness and chat judges. When a strong reaction has no
-clear spoken highlight, a vision-capable model can check a few buffered frames. Selected windows include setup and
-payoff, and overlaps are filtered before rendering. The gameplay layout fills the 9:16 frame and includes a
-detected facecam. The preset allows clips up to 90 seconds. English captions use the existing translation path and
-require usable speech recognition and a working model. The crop can still lose a HUD at the frame edge. Use the
-existing layout editor before approving clips that need a wider view.
+The watchlist uses loudness and chat to locate possible reactions. A vision-capable model can check nearby buffered
+frames for a clear action and payoff. Overlapping windows are filtered before rendering. The preset allows clips up
+to 90 seconds. Gameplay captions require a verified, isolated streamer microphone track. Buffer drafts require a
+quality check on the finished video. [Before-and-after examples and setup](docs/CLIP_QUALITY.md)
 
 Live access depends on each platform's public endpoints and yt-dlp support. Chat reactions are currently available
 on Twitch. Sampled frames may miss short action, and quiet events without a signal can be missed. The preset

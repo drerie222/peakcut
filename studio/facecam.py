@@ -1,9 +1,7 @@
 """Where the facecam is.
 
 A gaming stream is a game with a small webcam picture in one corner of it. The
-short that comes out of it is better when the game fills the screen and the
-webcam sits in the corner of it, instead of the whole 16:9 frame squeezed into
-a band with blurred fill above and below.
+short keeps the gameplay readable and shows the webcam separately.
 
 The webcam is found by the one thing a webcam always has and a game almost never
 has: a straight border that stays in the same place in every frame. A wall in
@@ -54,9 +52,9 @@ def _frames(path: str | Path, count: int = MAX_FRAMES) -> np.ndarray:
         dur = _duration(path)
         rate = max(count / dur, 0.02) if dur > 0 else 0.2
         proc = subprocess.run(
-            ["ffmpeg", "-v", "error", "-i", str(path),
+            ["ffmpeg", "-v", "error", *load.ffmpeg_threads(), "-i", str(path), "-filter_threads", "1",
              "-vf", f"fps={rate:.4f},scale={W}:{H},format=gray",
-             "-frames:v", str(count), "-f", "rawvideo", "-"],
+             "-frames:v", str(count), "-threads", "1", "-f", "rawvideo", "-"],
             capture_output=True, timeout=180)
     except Exception:  # noqa: BLE001 - no ffmpeg or an unreadable file: no facecam, not a failure
         return np.zeros((0, H, W), dtype=np.uint8)
@@ -218,6 +216,16 @@ def _overlap(a, box) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _framing(best, candidates):
+    """Prefer the surrounding webcam border over a strong interior edge of the same camera."""
+    area = (best["x1"] - best["x"]) * (best["y1"] - best["y"])
+    larger = [box for box in candidates if box["x"] <= best["x"] + 1 and box["y"] <= best["y"] + 1
+              and box["x1"] >= best["x1"] - 1 and box["y1"] >= best["y1"] - 1
+              and area < (box["x1"] - box["x"]) * (box["y1"] - box["y"]) <= area * 2.1
+              and box["score"] >= best["score"] * 0.5 and box["moving"] <= max(3.0, best["moving"] * 1.5)]
+    return max(larger, key=lambda box: (box["x1"] - box["x"]) * (box["y1"] - box["y"]), default=best)
+
+
 @load.serial_work
 def _full_frame(path: str | Path) -> np.ndarray | None:
     """One grey frame at full size, from the middle of the video: where the borders are measured."""
@@ -226,8 +234,8 @@ def _full_frame(path: str | Path) -> np.ndarray | None:
         return None
     try:
         raw = subprocess.run(
-            ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, _duration(path) / 2.0):.1f}", "-i", str(path),
-             "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+            ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, _duration(path) / 2.0):.1f}", *load.ffmpeg_threads(),
+             "-i", str(path), "-filter_threads", "1", "-threads", "1", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
             capture_output=True, timeout=120).stdout or b""
     except Exception:  # noqa: BLE001
         return None
@@ -252,8 +260,10 @@ def _snap(path: str | Path, box, w: int, h: int, span: float = 0.0):
     if frame is None:
         return None
     fh, fw = frame.shape
-    col = np.abs(np.diff(frame, axis=1)).sum(axis=0)
-    row = np.abs(np.diff(frame, axis=0)).sum(axis=1)
+    x0, y0, x1, y1 = box
+    a, b, c, d = (int(x0 * fw / W), int(y0 * fh / H), int(x1 * fw / W), int(y1 * fh / H))
+    col = np.abs(np.diff(frame[b:d, :], axis=1)).sum(axis=0)
+    row = np.abs(np.diff(frame[:, a:c], axis=0)).sum(axis=1)
     # The small grid is a quarter of the picture, so a border found on it is a few pixels out; one the
     # model proposed can be a good part of the frame out, which is what `span` is for.
     spread = max(4.0, span * max(fw, fh), 1.5 * max(fw / W, fh / H))
@@ -263,7 +273,6 @@ def _snap(path: str | Path, box, w: int, h: int, span: float = 0.0):
             return float(edge)
         return _best(profile, approx, spread)
 
-    x0, y0, x1, y1 = box
     return (line(col, x0 * fw / W, 0, fw), line(row, y0 * fh / H, 0, fh),
             line(col, x1 * fw / W, fw, fw), line(row, y1 * fh / H, fh, fh))
 
@@ -310,7 +319,8 @@ def _frame_jpeg(path: str | Path, width: int = 768, at=None) -> bytes:
     """One frame of the stream, small, as a JPEG: what a model is shown."""
     try:
         return subprocess.run(
-            ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, _duration(path) / 2.0 if at is None else at):.1f}", "-i", str(path),
+            ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, _duration(path) / 2.0 if at is None else at):.1f}",
+             *load.ffmpeg_threads(), "-i", str(path), "-filter_threads", "1", "-threads", "1",
              "-frames:v", "1", "-vf", f"scale={width}:-2", "-pix_fmt", "yuvj420p", "-q:v", "4",
              "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
             capture_output=True, timeout=120 if at is None else 10).stdout or b""
@@ -323,7 +333,7 @@ def frame_strip(segments, times):
     from PIL import Image
 
     frames = []
-    for t in times:
+    for t in sorted({round(t, 1) for t in times}):
         part = next(((path, start) for path, start, end in segments if start <= t < end), None)
         if not part:
             continue
@@ -409,10 +419,10 @@ def detect(path: str | Path, ask=None) -> dict | None:
         # matches none of them is its own box measured and used.
         match = max(found, key=lambda c: _overlap(c, hinted)) if found else None
         if match and _overlap(match, hinted) >= MATCH:
-            return _finish(path, match, w, h, still)
+            return _finish(path, _framing(match, found), w, h, still)
         seen = _seen(path, hinted, w, h, still, light, edges)
         if seen:
             return seen
     if not found:
         return None
-    return _finish(path, found[0], w, h, still)
+    return _finish(path, _framing(found[0], found), w, h, still)

@@ -200,6 +200,7 @@ def test_retention_and_integrations():
                                                                   "post": {"id": "draft-test", "status": "draft"}}}}),
                httpx.Response(200, json={"data": {"post": {"id": "draft-test", "status": "sent"}}})]
     with (patch.dict(os.environ, BUFFER_API_KEY="test-secret"),
+          patch.object(buffer.quality, "review", return_value={"issues": []}),
           patch.object(buffer.httpx, "post", side_effect=replies) as http,
           patch.object(config, "RAW_RETENTION_HOURS", 168)):
         buffer.create(job, clip)

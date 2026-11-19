@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import alerts, auth, brain, config, creators, ctx, facecam, games, jobs, load, media, transcribe, usage
+from . import alerts, auth, brain, config, creators, ctx, facecam, games, jobs, load, media, speaker, transcribe, usage
 
 # ":username!user@host PRIVMSG #channel :the message"
 _NICK = re.compile(r"(?m)^:([A-Za-z0-9_]{2,25})!")
@@ -163,7 +163,7 @@ class Session:
         self.spikes = 0
         self.game = ""                # which game this stream is, when it can be told
         self.facecam_box = None       # where the webcam is, found once the first clip is made
-        self.facecam_checked = False  # the look is made once, even when it finds nothing
+        self.facecam_part = None     # a reconnect can change the overlay or the source resolution
         self.ai_busy = 0.0            # when the AI check now running was started, 0 when none is
 
     def _ask_ai(self, window=None, why=None):
@@ -294,7 +294,9 @@ class Session:
             for u in info["urls"]:
                 cmd += [*load.ffmpeg_threads(), "-i", u]
             a_in = "1:a:0" if len(info["urls"]) > 1 else "0:a:0"
-            cmd += ["-map", "0:v:0", "-map", a_in, "-c", "copy", "-f", "segment", "-segment_time", str(SEG_SEC),
+            track = speaker.declared_track(self.job.get("game_mic_track"))
+            mic = ["-map", f"{a_in[:-1]}{track - 1}?"] if track else []
+            cmd += ["-map", "0:v:0", "-map", a_in, *mic, "-c", "copy", "-f", "segment", "-segment_time", str(SEG_SEC),
                     "-reset_timestamps", "1", "-segment_format", "mpegts", "-segment_list", f"{p}.csv",
                     "-segment_list_type", "csv", f"{p}_%05d.ts",
                     "-map", a_in, "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"]
@@ -427,6 +429,14 @@ class Session:
 
     # ---------------------------------------------------------------- analysis
     def _transcribe_step(self):
+        if self._game() or speaker.protected(self.job, self.settings):
+            with self.lock:
+                if not self.pending:
+                    return False
+                self.pending_base += len(self.pending) // 2
+                self.pending.clear()
+                self.t_done = self.pending_base / SR
+            return True
         with self.lock:
             n = len(self.pending) // 2
             hurry = self.ended or bool(self.manual)
@@ -502,7 +512,8 @@ class Session:
             now = self.t_done
             ws = max(0.0, now - max(every, 3) * 60 - 90)  # each check overlaps the last by 90 s, so nothing falls between
         self.last_check = self.t_done
-        win = [w for w in self.words if ws <= w["s"] <= now]
+        gameplay = bool(self._game() or speaker.protected(self.job, st))
+        win = [] if gameplay else [w for w in self.words if ws <= w["s"] <= now]
         recent = [c for c in self.job["clips"] if c.get("score", 0) > 0 and time.time() - c.get("made_at", 0) < 3600]
         last_clip = max((c.get("made_at", 0) for c in self.job["clips"]), default=self.started_at)
         must = st["must_clip_min"] > 0 and time.time() - last_clip >= st["must_clip_min"] * 60
@@ -514,10 +525,11 @@ class Session:
         title, up = self.job["title"], self.job["uploader"]
         watch = bool(self.job.get("watch_broadcast"))
         if len(win) < 8:
-            if watch and self._visual_highlight(ws, now, why, verdict):
+            before = self.WATCH_BEFORE if watch else self.AUTO_BEFORE
+            if gameplay and self._visual_highlight(ws, now, why, verdict, peak=window[0] + before if window else None):
                 return
             self.skipped += 1
-            return self._verdict(verdict, "Skipped: nobody talking")
+            return self._verdict(verdict, "No verified gameplay highlight" if gameplay else "Skipped: nobody talking")
         try:
             cands, tok = brain.judge_transcript(win, ws, now, title, up, st["min_len"], st["max_len"], self.job["clips"],
                                                 n=1 if every <= 2 else 2, must=must, game=self._game(),
@@ -576,15 +588,16 @@ class Session:
             if added >= (1 if every <= 2 else 2):
                 break
 
-    def _visual_highlight(self, start, end, why, verdict):
+    def _visual_highlight(self, start, end, why, verdict, peak=None):
         """One image check around a strong reaction when the words didn't identify a moment."""
         if not why or not why.startswith("Jump:"):
             return False
-        peak = start + self.WATCH_BEFORE
+        if peak is None:
+            peak = start + (self.WATCH_BEFORE if self.job.get("watch_broadcast") else self.AUTO_BEFORE)
         length = min(61, self.settings["max_len"])
         a = max(start, peak - min(36, length * 0.6))
         b = min(end, a + length)
-        if b - a < self.settings["min_len"] or brain._overlaps(a, b, self.job["clips"]):
+        if not a <= peak < b or b - a < self.settings["min_len"] or brain._overlaps(a, b, self.job["clips"]):
             return False
         if any(abs(a - c["start"]) < self.settings["min_gap_min"] * 60 for c in self.job["clips"]):
             return False
@@ -592,13 +605,14 @@ class Session:
         with self.lock:
             segments = list(self.segments)
         try:
-            jpeg = facecam.frame_strip(segments, (peak - 8, peak, min(end - 2, peak + 8)))
+            jpeg = facecam.frame_strip(segments, (max(a, peak - 8), peak, min(b - 0.25, peak + 8)))
             candidate, tokens = brain.judge_gameplay(jpeg, a, b, self.job["title"], self._game(), config.LIVE_AI_TIMEOUT)
         except Exception:  # noqa: BLE001 - clip decisions still work with text-only AI or a missing frame
             return False
         self.tokens += tokens
         if not candidate or candidate["score"] < self.settings["min_score"]:
             return False
+        candidate.update(evidence="visual", peak_sec=peak, quality_min_score=self.settings["min_score"])
         self._add_clip(candidate)
         self._verdict(verdict, "Clipped: visible action near a reaction spike")
         return True
@@ -636,17 +650,16 @@ class Session:
     def _manual_step(self):
         with self.lock:
             ready = [m for m in self.manual if m["end"] <= self.t_done or self.ended]
+        gameplay = bool(self._game() or speaker.protected(self.job, self.settings))
         for req in ready:
-            text = " ".join(w["w"] for w in self.words if req["start"] <= w["s"] <= req["end"])
-            usage.set_context(self.job["creator"], self.job["title"] or "Live stream")
-            try:
-                c = brain.describe(text, self.job["title"], self.job["uploader"], game=self._game(),
-                                   timeout=config.LIVE_AI_TIMEOUT)
-            except Exception as e:  # noqa: BLE001
-                # Someone asked for this clip by hand. A slow or broken AI costs it its hook, not the clip.
-                self.job["ai"]["last_error"] = str(e)[-200:]
-                c = {"score": 0, "category": "other", "hook": "", "title": self.job["title"],
-                     "description": "", "hashtags": [], "highlight_words": []}
+            c = brain._tidy({"title": self.job["title"]}, req["start"], req["end"], self._game())
+            if not gameplay:
+                text = " ".join(w["w"] for w in self.words if req["start"] <= w["s"] <= req["end"])
+                usage.set_context(self.job["creator"], self.job["title"] or "Live stream")
+                try:
+                    c = brain.describe(text, self.job["title"], self.job["uploader"], timeout=config.LIVE_AI_TIMEOUT)
+                except Exception as e:  # noqa: BLE001 - the local clip still renders if the optional AI fails
+                    self.job["ai"]["last_error"] = str(e)[-200:]
             with self.lock:
                 if self.user_stopped:
                     return
@@ -686,26 +699,36 @@ class Session:
         lst = self.dir / "clips" / f"{clip['id']}.txt"
         lst.write_text("".join(f"file '{s[0].as_posix()}'\n" for s in segs), encoding="utf-8")
         src = self.dir / "clips" / f"{clip['id']}.src.ts"
+        parts = {s[0].stem.split("_")[0] for s in segs}
+        mic = len(parts) == 1 and bool(speaker.declared_track(self.job.get("game_mic_track")))
+        mapping = ["-map", "0:v:0", "-map", "0:a:0"] + (["-map", "0:a:1?"] if mic else [])
         try:
             with load.heavy_work(writes_video=True):
                 media.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(lst),
-                           "-c", "copy", str(src)])
+                           *mapping, "-c", "copy", str(src)])
         except Exception as e:  # noqa: BLE001
             clip.update(status="error", error=media_safe(e))
             jobs.save(self.job)
             return
         finally:
             lst.unlink(missing_ok=True)
-        # Only the gameplay layout uses a webcam, and only once the clip's own file is written: the
-        # webcam is looked for in it, once per stream.
+        if mic:
+            # The recorder maps the optional mic immediately after the programme audio. Across reconnects
+            # the source streams may change, so a clip spanning different inputs has no trusted mic.
+            clip["mic_track"] = 2
+        else:
+            clip.pop("mic_track", None)
         if clip.get("layout") == "gameplay":
-            if not self.facecam_checked:
+            if self.facecam_part != parts or not self.facecam_box:
                 self.facecam_box = self._find_facecam(src)
-                self.facecam_checked = True
+                self.facecam_part = parts
             if self.facecam_box:
                 clip["facecam"] = self.facecam_box
+            clip["facecam_checked"] = True
         dur = segs[-1][2] - segs[0][1]
-        offset = self._align(src, segs[0][1] + self.clock_fix, dur)
+        offset = segs[0][1] + self.clock_fix
+        if self.words and not speaker.protected(self.job, clip):
+            offset = self._align(src, offset, dur)
         self.clock_fix = offset - segs[0][1]  # the two clocks drift ~4 s an hour; start the next clip from here
         clip.update(src=str(src), src_offset=round(offset, 2), src_end=round(offset + dur, 2))
         clip["start"] = max(clip["start"], clip["src_offset"])
@@ -752,7 +775,8 @@ class Session:
 
     def _publish(self):
         elapsed = self.samples / SR
-        lines = brain.make_lines([w for w in self.words if w["s"] >= self.t_done - 45])[-5:]
+        lines = [] if speaker.protected(self.job, self.settings) else brain.make_lines(
+            [w for w in self.words if w["s"] >= self.t_done - 45])[-5:]
         with self.lock:
             sec = int(elapsed)
             self.job.update(

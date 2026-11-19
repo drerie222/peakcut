@@ -79,7 +79,7 @@ def install_fonts():
 
 
 LAYOUTS = {"blur": "Full frame + blurred fill", "zoom": "Zoomed in + blurred fill", "crop": "Fill the screen (centre crop)",
-           "gameplay": "Gameplay fills the screen, facecam in the corner"}
+           "gameplay": "Full gameplay with a separate facecam"}
 
 
 def _ts(t):
@@ -120,7 +120,9 @@ def geometry(src_w, src_h, layout):
     else:
         fg_h = H
     top = (H - fg_h) // 2
-    if layout in ("crop", "gameplay"):
+    if layout == "gameplay":
+        return layout, fg_h, 235, 1500
+    if layout == "crop":
         return layout, fg_h, 300, 1380
     return layout, fg_h, max(230, top - 190), min(1640, top + fg_h + 180)
 
@@ -156,7 +158,7 @@ def _hook_events(hook, dur, y):
     return ev
 
 
-def build_ass(words, start, end, hook, style_name, highlight, hook_y, cap_y) -> str:
+def build_ass(words, start, end, hook, style_name, highlight, hook_y, cap_y, *, gameplay=False) -> str:
     st = STYLES.get(style_name, STYLES["bounce"])
     words = [dict(w, s=w["s"] - CAPTION_LEAD, e=w["e"] - CAPTION_LEAD) for w in words]
     strong = {_key(h) for h in highlight if _key(h)}
@@ -176,7 +178,7 @@ Style: Hook,{HOOK['font']},{HOOK['size']},&H00{HOOK['ink']},&H00{HOOK['ink']},&H
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     dur = end - start
-    ev = _hook_events(_clean(hook), dur, hook_y)
+    ev = _hook_events(_clean(hook), min(dur, 3.0) if gameplay else dur, hook_y)
     f = _Font.get(st["font"])
     inside = [dict(w, w=_clean(w["w"])) for w in words if w["s"] >= start - 0.05 and w["s"] < end]
     inside = sorted((w for w in inside if w["w"]), key=lambda w: w["s"])
@@ -202,8 +204,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         size = st["size"]
         gap = f.width("n n", size) - 2 * f.width("n", size) + (2 * st["outline"] + 6) * size / st["size"]   # a space, plus room for both outlines
         total = sum(f.width(t, size) for t in texts) + gap * (len(texts) - 1)
-        if total > CAP_MAX_W:                                  # a long phrase: shrink it to fit, never run off the frame
-            size = max(36, int(size * CAP_MAX_W / total))
+        cap_width = 820 if gameplay else CAP_MAX_W
+        if total > cap_width:                                  # a long phrase: shrink it to fit, never run off the frame
+            size = max(36, int(size * cap_width / total))
             gap = f.width("n n", size) - 2 * f.width("n", size) + (2 * st["outline"] + 6) * size / st["size"]   # a space, plus room for both outlines
             total = sum(f.width(t, size) for t in texts) + gap * (len(texts) - 1)
         cy = cap_y - f.cap_shift(size)
@@ -228,36 +231,41 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return head + "\n".join(ev) + "\n"
 
 
-PIP_W = 380            # how wide the facecam is in the 1080-wide frame
-PIP_MARGIN = 26
+def _face_crop(face, width, height):
+    """Leave a framing margin around the detected box and keep every edge inside the decoded frame."""
+    try:
+        x, y, w, h = (int(v) for v in face)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if w <= 8 or h <= 8 or not (0 <= x < x + w <= width and 0 <= y < y + h <= height):
+        return None
+    padx, pady = max(2, round(w * 0.07)), max(2, round(h * 0.07))
+    left, top = max(0, x - padx) // 2 * 2, max(0, y - pady) // 2 * 2
+    right, bottom = min(width, x + w + padx + 1) // 2 * 2, min(height, y + h + pady + 1) // 2 * 2
+    return left, top, right - left, bottom - top
 
 
 def _filter(layout, fg_h, facecam=None):
-    if layout == "gameplay" and facecam:
-        # The game fills the screen, and the webcam sits in the top corner of it, so a viewer sees
-        # the play and the face at the same time.
-        fx, fy, fw, fh = (int(v) for v in facecam)
-        if fw > 8 and fh > 8:
-            pip_h = max(2, int(round(PIP_W * fh / fw)))
-            return (f"[0:v]fps={config.OUT_FPS},split=2[base][fc];"
-                    f"[base]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1[b];"
-                    f"[fc]crop={fw}:{fh}:{fx}:{fy},scale={PIP_W}:{pip_h},setsar=1[p];"
-                    f"[b][p]overlay={W - PIP_W - PIP_MARGIN}:{PIP_MARGIN}[v0];")
-    if layout == "crop" or (layout == "gameplay" and not facecam):
+    if layout == "gameplay":
+        split = "split=3[bg][game][fc]" if facecam else "split=2[bg][game]"
+        layers = (f"[0:v]fps={config.OUT_FPS},{split};"
+                  f"[bg]scale=135:240:force_original_aspect_ratio=increase,crop=135:240,boxblur=6:2,"
+                  f"scale={W}:{H},eq=brightness=-0.12:saturation=0.75[b];"
+                  f"[game]scale={W}:660:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[g];")
+        center = 1060 if facecam else 950
+        if not facecam:
+            return layers + f"[b][g]overlay=(W-w)/2:{center}-h/2,setsar=1[v0];"
+        x, y, w, h = facecam
+        return (layers + f"[b][g]overlay=(W-w)/2:{center}-h/2[withgame];"
+                f"[fc]crop={w}:{h}:{x}:{y},scale=640:384:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[p];"
+                "[withgame][p]overlay=(W-w)/2:520-h/2,setsar=1[v0];")
+    if layout == "crop":
         return f"[0:v]fps={config.OUT_FPS},scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1[v0];"
     return (f"[0:v]fps={config.OUT_FPS},split=2[a][b];"
             f"[a]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,boxblur=6:2,"
             f"scale={W}:{H},eq=brightness=-0.14:saturation=1.15[bg];"
             f"[b]scale={W}:{fg_h}:force_original_aspect_ratio=increase,crop={W}:{fg_h}[fg];"
             f"[bg][fg]overlay=0:(H-h)/2,setsar=1[v0];")
-
-
-def _hook_y(layout, hook_y, facecam=None):
-    """Where the heading goes. In the gameplay layout the webcam sits in the top corner, so a heading
-    across the top would run under it: it goes just below the picture instead."""
-    if layout == "gameplay" and facecam and len(facecam) == 4 and facecam[2] > 8:
-        return PIP_MARGIN + int(round(PIP_W * facecam[3] / facecam[2])) + 32
-    return hook_y
 
 
 _qsv_ok = None
@@ -269,12 +277,9 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     out_dir.mkdir(parents=True, exist_ok=True)
     start, end = clip["start"], clip["end"]
     layout, fg_h, hook_y, cap_y = geometry(src_w, src_h, clip.get("layout", "blur"))
-    face = clip.get("facecam")
-    if layout == "gameplay" and not (face and len(face) == 4):
-        layout = "crop"     # no webcam found: the game fills the screen, which is still the right shape
-    hook_y = _hook_y(layout, hook_y, face)
+    face = _face_crop(clip.get("facecam"), src_w, src_h) if layout == "gameplay" else None
     ass = build_ass(words if clip.get("captions", True) else [], start, end, clip.get("hook", ""), clip.get("style", "bounce"),
-                    clip.get("highlight_words", []), hook_y, cap_y)
+                    clip.get("highlight_words", []), hook_y, cap_y, gameplay=bool(clip.get("gameplay_source") or layout == "gameplay"))
     # The clip is made in a short work folder and moved into place afterwards. The caption step of ffmpeg cannot
     # open files whose full path is longer than 260 characters on Windows, which a data folder deep inside other
     # folders easily reaches. Inside the work folder every name is short and relative (a drive colon would also

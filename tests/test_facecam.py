@@ -111,20 +111,18 @@ try:
     with patch.object(_ai, "see", return_value=("I am a text model.", 0, 0)):
         check("an answer that is neither is not believed", brain.look_for_facecam(b"jpeg")["looked"], False)
 
-    # ---- the layout: the game fills the screen and the webcam sits in the corner
+    # ---- the layout: full gameplay plus a separate, bounded facecam
     f = render._filter("gameplay", 1920, [0, 0, 300, 170])
-    check("the game fills the screen", "scale=1080:1920" in f and "crop=1080:1920" in f, True)
+    check("the entire game fits in the portrait layout", "scale=1080:660:force_original_aspect_ratio=decrease" in f, True)
     check("the webcam is cropped out of the source", "crop=300:170:0:0" in f, True)
-    check("the webcam is put in the corner", "overlay=" in f, True)
-    check("without a webcam the game simply fills the screen",
-          "scale=1080:1920" in render._filter("gameplay", 1920, None) and "overlay=" not in render._filter("gameplay", 1920, None), True)
+    check("the webcam is enlarged separately from the game", "scale=640:384:force_original_aspect_ratio=decrease" in f, True)
+    check("without a webcam the gameplay remains uncropped",
+          "force_original_aspect_ratio=decrease" in render._filter("gameplay", 1920, None), True)
     check("the layout is offered to the user", "gameplay" in render.LAYOUTS, True)
-    # the heading must not run under the webcam picture
-    pip_h = 380 * 376 / 363
-    check("the heading goes below the webcam picture", render._hook_y("gameplay", 300, [0, 0, 363, 376]) > 26 + pip_h, True)
-    check("another picture moves the heading with it",
-          render._hook_y("gameplay", 300, [0, 0, 300, 170]) < render._hook_y("gameplay", 300, [0, 0, 363, 376]), True)
-    check("without a webcam the heading stays at the top", render._hook_y("crop", 300, None), 300)
+    _, _, hook_y, caption_y = render.geometry(1920, 1080, "gameplay")
+    check("the heading stays above even the tallest facecam", hook_y < 520 - 384 / 2, True)
+    check("the captions stay below the gameplay region", caption_y > 1060 + 660 / 2, True)
+    check("the centre crop retains its existing heading position", render.geometry(1920, 1080, "crop")[2], 300)
 finally:
     shutil.rmtree(work, ignore_errors=True)      # the pictures are big; they must not be left behind
 
