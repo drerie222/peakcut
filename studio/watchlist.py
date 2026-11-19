@@ -270,6 +270,7 @@ def _export(job, clip, state):
         jobs.save(job)
         return
     state["attempts"] += 1
+    started = time.monotonic()
     try:
         description = "\n\n".join(filter(None, (clip.get("description"), " ".join("#" + h for h in clip.get("hashtags", [])))))
         buffer.create(job, clip, description=description)
@@ -286,6 +287,8 @@ def _export(job, clip, state):
         state.update(state="draft", error="")
         discord_clips.event("clips", f"{job['id']}:{clip['id']}:buffer-draft",
                             f"TikTok draft ready for review in Buffer. {clip.get('title') or 'Clip'}")
+    finally:
+        jobs.add_timing(job, "export", time.monotonic() - started)
     jobs.save(job)
 
 

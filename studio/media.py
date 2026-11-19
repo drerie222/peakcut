@@ -307,6 +307,33 @@ def probe(path: Path) -> dict:
     return {"width": w, "height": h, "duration": float(data["format"]["duration"])}
 
 
+
+def recording_quality(path: Path) -> dict:
+    """Read codec and delivered stream properties from a closed local recording segment."""
+    cmd = ["ffprobe", "-v", "error", "-of", "json", "-show_format", "-show_streams", str(path)]
+    data = json.loads(run(cmd, timeout=8))
+    streams = data.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
+    from fractions import Fraction
+    try:
+        fps = round(float(Fraction(video.get("avg_frame_rate") or "0/1")), 2)
+    except (ValueError, ZeroDivisionError):
+        fps = 0
+    if not fps:
+        try:
+            fps = round(float(Fraction(video.get("r_frame_rate") or "0/1")), 2)
+        except (ValueError, ZeroDivisionError):
+            fps = 0
+
+    def number(value):
+        return int(value) if str(value).isdigit() else None
+
+    return {"width": number(video.get("width")), "height": number(video.get("height")), "fps": fps or None,
+            "bitrate": number(data.get("format", {}).get("bit_rate")), "video_codec": video.get("codec_name"),
+            "audio_codec": audio.get("codec_name"), "audio_hz": number(audio.get("sample_rate")),
+            "audio_channels": number(audio.get("channels")), "audio_bitrate": number(audio.get("bit_rate"))}
+
 def extract_audio(src: Path, wav: Path, *, track=None, start=0, seconds=None):
     # first_pts=0 pads any gap before the audio starts, so second 0 of the wav is second 0 of the file
     # -t: never more audio than the longest video allowed, whatever the file claims about itself

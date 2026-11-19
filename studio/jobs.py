@@ -147,7 +147,7 @@ def job_dir(jid) -> Path:
     return Path(_jobs[jid]["dir"])
 
 
-HIDDEN = ("dir", "user", "source_path", "recover")
+HIDDEN = ("dir", "user", "source_path", "recover", "candidates", "recording_offsets", "recording_probe_part")
 
 
 def public(job) -> dict:
@@ -155,6 +155,9 @@ def public(job) -> dict:
     out = {k: v for k, v in job.items() if k not in HIDDEN}
     out["source"] = {k: v for k, v in job["source"].items() if k != "path"}
     out["clips"] = [{k: v for k, v in c.items() if k not in ("src", "fixed_words", "fixed_for")} for c in job["clips"]]
+    if job.get("candidates"):
+        out["candidates"] = [{k: entry[k] for k in ("id", "start", "end", "signal", "state", "reason", "due")
+                              if k in entry} for entry in job["candidates"]]
     ai = job.get("ai") or {}
     out["ai"] = {"tokens": ai.get("tokens", 0), "note": ai.get("note", ""), "used": bool(ai.get("model"))}   # never the model, never raw errors
     if job.get("status") == "queued":
@@ -223,7 +226,10 @@ def _load_file(f: Path, uid: str):
         if c.get("src"):
             c["src"] = _remap(c["src"], f.parent / "clips")
         if c.get("status") in ("rendering", "queued"):
-            if buffered and not c.get("src"):
+            if c.get("candidate") and any(entry["id"] == c["candidate"] and entry["state"] == "accepted"
+                                          for entry in job.get("candidates", [])):
+                c["status"] = "queued"
+            elif buffered and not c.get("src"):
                 c["status"] = "queued"  # the stream is still on disk: live.recover() finishes these
                 job["recover"] = True
             elif job.get("resume"):
@@ -329,6 +335,25 @@ def submit_live(fn):
     _live_q.put(ctx.bind(fn))
 
 
+
+def try_submit_live(fn):
+    try:
+        _live_q.put_nowait(ctx.bind(fn))
+    except queue.Full:
+        return False
+    return True
+
+
+def live_waiting():
+    return _live_q.qsize()
+
+
+def add_timing(job, stage, seconds):
+    with _lock:
+        stats = job.setdefault("pipeline", {})
+        stats[stage + "_seconds"] = round(stats.get(stage + "_seconds", 0) + seconds, 2)
+        stats[stage + "_runs"] = stats.get(stage + "_runs", 0) + 1
+
 def _live_worker():
     while True:
         fn = _live_q.get()
@@ -424,14 +449,21 @@ def render_one(job, clip, words, *, verified_mic=False):
             elif verified_mic and not clip.get("src"):
                 clip["speech_source"] = "isolated_mic"
             else:
+                started = time.monotonic()
                 words, clip["speech_source"] = speaker.captions(job, clip, src, off)
+                if clip["speech_source"] == "isolated_mic":
+                    add_timing(job, "transcribe", time.monotonic() - started)
             clip["hook"] = speaker.hook(clip)
             clip["highlight_words"] = []   # a visual description must not highlight words from the programme mix
         else:
             width, height = job["width"], job["height"]
         local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
         near = _caption_words(job, clip, words, off) if clip.get("captions", True) else []
-        out = render.render_clip(src, d / "clips", clip["id"], local, near, width, height)
+        started = time.monotonic()
+        try:
+            out = render.render_clip(src, d / "clips", clip["id"], local, near, width, height)
+        finally:
+            add_timing(job, "render", time.monotonic() - started)
         version = clip.get("version", 0) + 1
         if gameplay:
             clip["quality"] = quality.review(d / "clips" / out["file"], clip, version, gameplay=True,

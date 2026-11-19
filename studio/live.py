@@ -43,6 +43,11 @@ def _trim_names(users: dict, second: int, kept: int) -> int:
     return second
 
 
+
+class CaptureUnavailable(NotLive):
+    pass
+
+
 def media_safe(e) -> str:
     from . import safe
     return safe.friendly(e, 300)
@@ -63,11 +68,15 @@ class _Quiet:
     def error(self, m): pass
 
 
-def resolve(url: str) -> dict:
+def resolve(url: str, height=None) -> dict:
     """Ask yt-dlp for the stream's playable address. Raises NotLive if the channel is offline."""
     import yt_dlp
+    height = height or config.LIVE_HEIGHT
+    constraint = f"[height<={height}][fps<=?{config.LIVE_FPS}]"
+    fallback = f"[height<=?{height}][fps<=?{config.LIVE_FPS}]"
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "logger": _Quiet(), "socket_timeout": 15,
-            "format": "b[height<=720]/bv*[height<=720]+ba/b"}
+            "format": f"bv*{constraint}+ba/b{constraint}/bv*{fallback}+ba/b{fallback}",
+            "format_sort": ["height", "fps", "tbr", "abr"], "format_sort_force": True}
     if media.is_youtube(url) and media.youtube_paused():
         raise NotLive(media.YT_BLOCKED)
     try:
@@ -76,7 +85,7 @@ def resolve(url: str) -> dict:
     except Exception as e:  # noqa: BLE001
         if media.note_refusal(url, e):
             raise NotLive(media.YT_BLOCKED) from e
-        raise NotLive(str(e)[-200:]) from e
+        raise CaptureUnavailable("The platform could not provide a playable live stream.") from None
     if not info or not info.get("is_live"):
         raise NotLive("This channel is not live right now.")
     fmts = info.get("requested_formats") or [info]
@@ -183,7 +192,7 @@ class Session:
             try:
                 self._ai_check(window, why)
             except Exception as e:  # noqa: BLE001
-                self.job["ai"]["last_error"] = str(e)[-200:]
+                self.job["ai"]["last_error"] = media_safe(e)
             finally:
                 self.ai_busy = 0.0
         self.ai_busy = now
@@ -274,25 +283,31 @@ class Session:
         url = self.job["source"]["url"]
         while not self.stop_flag.is_set():
             try:
-                info = resolve(url)
+                cap = (config.LIVE_HEIGHT, min(720, config.LIVE_HEIGHT), min(480, config.LIVE_HEIGHT))[min(fails, 2)]
+                info = resolve(url, cap)
             except NotLive as e:
                 fails += 1
-                if self.samples == 0 or fails >= 3:
+                if fails >= 3:
                     if self.samples == 0:
                         self.job["error"] = f"Could not start recording: {e}"
+                    elif isinstance(e, CaptureUnavailable):
+                        self.job["error"] = "The platform could not reconnect the recording."
                     break
-                self.stop_flag.wait(10)
+                self.stop_flag.wait(min(20, 2 ** fails * 2))
                 continue
             if not self.job.get("uploader"):
                 self.job.update(title=info["title"], uploader=info["uploader"])
+            if self.part:
+                self._scan_segments()  # close the preceding timeline before opening a new part
             self.part += 1
             with self.lock:
                 self.seg_clock = max(self.seg_clock, self.samples / SR)
+                self.job.setdefault("recording_offsets", {})[str(self.part)] = self.seg_clock
             p = f"p{self.part:02d}"
             cmd = ["ffmpeg", "-v", "error", "-reconnect", "1", "-reconnect_streamed", "1",
                    "-reconnect_delay_max", "10"]
             for u in info["urls"]:
-                cmd += [*load.ffmpeg_threads(), "-i", u]
+                cmd += [*load.ffmpeg_threads(), "-rw_timeout", "15000000", "-i", u]
             a_in = "1:a:0" if len(info["urls"]) > 1 else "0:a:0"
             track = speaker.declared_track(self.job.get("game_mic_track"))
             mic = ["-map", f"{a_in[:-1]}{track - 1}?"] if track else []
@@ -300,42 +315,62 @@ class Session:
                     "-reset_timestamps", "1", "-segment_format", "mpegts", "-segment_list", f"{p}.csv",
                     "-segment_list_type", "csv", f"{p}_%05d.ts",
                     "-map", a_in, "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"]
-            with open(self.dir / "ffmpeg.log", "ab") as errlog:
+            with self.lock:
+                if self.stop_flag.is_set():
+                    break
+                self.proc = subprocess.Popen(cmd, cwd=self.buf, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                             creationflags=media.NO_WINDOW)
+            guard_stop = threading.Event()
+            self.last_capture = time.monotonic()
+            threading.Thread(target=self._capture_guard, args=(self.proc, guard_stop), daemon=True).start()
+            got = 0
+            while True:
+                data = self.proc.stdout.read(SR * 2)  # one second of 16-bit mono
+                if not data:
+                    break
+                data = data[: len(data) // 2 * 2]
+                got += len(data)
+                self.last_capture = time.monotonic()
+                x = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                level = float(20 * np.log10(np.sqrt((x ** 2).mean() + 1e-10))) if len(x) else -100.0
                 with self.lock:
-                    if self.stop_flag.is_set():
-                        break
-                    self.proc = subprocess.Popen(cmd, cwd=self.buf, stdout=subprocess.PIPE, stderr=errlog,
-                                                 creationflags=media.NO_WINDOW)
-                got = 0
-                while True:
-                    data = self.proc.stdout.read(SR * 2)  # one second of 16-bit mono
-                    if not data:
-                        break
-                    data = data[: len(data) // 2 * 2]
-                    got += len(data)
-                    x = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                    level = float(20 * np.log10(np.sqrt((x ** 2).mean() + 1e-10))) if len(x) else -100.0
-                    with self.lock:
-                        self.pending += data
-                        self.samples += len(data) // 2
-                        self.db.append(level)
-                        overloaded = len(self.pending) > SR * 2 * config.LIVE_AUDIO_BACKLOG
-                    if load.render_disk_full():
-                        self.stop("Recording stopped because disk space is low")
-                        break
-                    if overloaded:
-                        self.job["error"] = "Recording paused because transcription fell behind."
-                        self.stop(self.job["error"])
-                        break
-                self.proc.wait()
+                    self.pending += data
+                    self.samples += len(data) // 2
+                    self.db.append(level)
+                    overloaded = len(self.pending) > SR * 2 * config.LIVE_AUDIO_BACKLOG
+                if load.render_disk_full():
+                    self.stop("Recording stopped because disk space is low")
+                    break
+                if overloaded:
+                    self.job["error"] = "Recording paused because transcription fell behind."
+                    self.stop(self.job["error"])
+                    break
+            self.proc.wait()
+            guard_stop.set()
+            if self.proc.returncode and not self.stop_flag.is_set():
+                self.job["recording_reconnects"] = self.job.get("recording_reconnects", 0) + 1
             fails = 0 if got > SR * 2 * 20 else fails + 1
             if fails >= 3:
+                if self.proc.returncode and not self.stop_flag.is_set():
+                    self.job["error"] = "The live source stopped delivering audio and video after reconnects."
                 break
             self.stop_flag.wait(3)
+        if not self.samples and not self.stop_flag.is_set() and not self.job.get("error"):
+            self.job["error"] = "The live stream did not deliver usable audio and video."
         self.ended = True
 
+    def _capture_guard(self, proc, stop):
+        while not stop.wait(5):
+            if proc.poll() is not None:
+                return
+            if time.monotonic() - self.last_capture >= config.LIVE_STALL_SECONDS:
+                proc.terminate()
+                self._force_stop(proc)
+                return
+
     def _scan_segments(self):
-        """Pick up buffer pieces ffmpeg has finished writing."""
+        """Pick up closed segments, then measure one actual file per connection."""
+        probe_at = None
         with self.lock:
             for i in range(1, self.part + 1):
                 f = self.buf / f"p{i:02d}.csv"
@@ -347,8 +382,12 @@ class Session:
                         dur = max(0.0, float(b) - float(a))
                     except ValueError:
                         continue
-                    self.segments.append((self.buf / name, self.seg_clock, self.seg_clock + dur))
+                    source = self.buf / name
+                    self.segments.append((source, self.seg_clock, self.seg_clock + dur))
                     self.seg_clock += dur
+                    if i == self.part and self.job.get("recording_probe_part") != i and source.is_file():
+                        self.job["recording_probe_part"] = i
+                        probe_at = source
                 self.csv_seen[i] = len(rows)
             keep_from = self.seg_clock - self.settings["buffer_min"] * 60
             spans = [(c["start"] - PAD, c["end"] + PAD) for c in self.job["clips"]
@@ -361,6 +400,11 @@ class Session:
                 else:
                     path.unlink(missing_ok=True)
             self.segments = keep
+        if probe_at:
+            try:
+                self.job["recording_quality"] = media.recording_quality(probe_at)
+            except (ValueError, RuntimeError, OSError):
+                self.job["recording_quality"] = {"unavailable": True}
 
     # ---------------------------------------------------------------- chat (Twitch only)
     def _chat(self, channel):
@@ -448,7 +492,11 @@ class Session:
         if not hurry or n > SR * 24:
             # cut at the quietest moment between 4 and 6.5 s, so no word is split; the rest waits for the next pass
             _, cut = next(transcribe._chunks(audio, 4.0, 6.5))
-        words = transcribe.transcribe(audio[:cut])
+        started = time.monotonic()
+        try:
+            words = transcribe.transcribe(audio[:cut])
+        finally:
+            jobs.add_timing(self.job, "transcribe", time.monotonic() - started)
         off = base / SR
         for w in words:
             w["s"], w["e"] = round(w["s"] + off, 2), round(w["e"] + off, 2)
@@ -485,7 +533,7 @@ class Session:
         loud_jump = cur / max(base, 1e-6) - 1
         pct = self.JUMP
         why = []
-        if loud_jump >= pct:
+        if loud_jump >= pct and cur >= 0.035:
             why.append(f"loudness +{round(loud_jump * 100)}%")
         chat_base = chat_now = None
         if chat is not None:
@@ -601,21 +649,15 @@ class Session:
             return False
         if any(abs(a - c["start"]) < self.settings["min_gap_min"] * 60 for c in self.job["clips"]):
             return False
+        return self._retain_highlight(a, b, peak, why)
+
+    def _retain_highlight(self, start, end, peak, signal):
+        from . import candidates
         self._scan_segments()
         with self.lock:
-            segments = list(self.segments)
-        try:
-            jpeg = facecam.frame_strip(segments, (max(a, peak - 8), peak, min(b - 0.25, peak + 8)))
-            candidate, tokens = brain.judge_gameplay(jpeg, a, b, self.job["title"], self._game(), config.LIVE_AI_TIMEOUT)
-        except Exception:  # noqa: BLE001 - clip decisions still work with text-only AI or a missing frame
-            return False
-        self.tokens += tokens
-        if not candidate or candidate["score"] < self.settings["min_score"]:
-            return False
-        candidate.update(evidence="visual", peak_sec=peak, quality_min_score=self.settings["min_score"])
-        self._add_clip(candidate)
-        self._verdict(verdict, "Clipped: visible action near a reaction spike")
-        return True
+            if self.segments and self.segments[-1][2] < end and not self.ended:
+                return None  # the last segment hasn't been closed by FFmpeg yet
+            return candidates.enqueue(self.job, self.settings, self.segments, start, end, peak, signal)
 
     def _verdict(self, v, result):
         self.verdicts.append(dict(v, result=result))
@@ -825,8 +867,19 @@ class Session:
                     self.said = None
                     self._ask_ai((said["t"] - self.SAID_BEFORE, said["t"] + self.SAID_AFTER), said["why"])
                 elif sp and (self.t_done >= sp["t"] + after or (self.ended and not busy)):
+                    signal = "Jump: " + sp["why"]
+                    if speaker.protected(self.job, self.settings):
+                        peak = sp["t"]
+                        length = min(61, self.settings["max_len"])
+                        a = max(0, peak - min(36, length * 0.6))
+                        b = min(self.t_done, a + length)
+                        if b - a >= self.settings["min_len"] and a <= peak < b:
+                            if self._retain_highlight(a, b, peak, signal) is None:
+                                time.sleep(.25)
+                                continue
+                    else:
+                        self._ask_ai((sp["t"] - before, sp["t"] + after), signal)
                     self.spike = None
-                    self._ask_ai((sp["t"] - before, sp["t"] + after), "Jump: " + sp["why"])
                 elif self.t_done - self.last_check >= interval or (self.ended and not busy and self.t_done > self.last_check):
                     self._ask_ai()
                 self._publish()
@@ -875,6 +928,7 @@ def recover(job):
     s.csv_seen = {}
     with s.lock:
         for i in range(1, s.part + 1):
+            s.seg_clock = max(s.seg_clock, job.get("recording_offsets", {}).get(str(i), 0))
             f = s.buf / f"p{i:02d}.csv"
             rows = [r.split(",") for r in f.read_text(encoding="utf-8", errors="ignore").splitlines() if r.count(",") >= 2]
             for name, a, b in (r[:3] for r in rows):
@@ -890,7 +944,7 @@ def recover(job):
     except Exception:  # noqa: BLE001
         s.words = []
     s.n = len(job["clips"])
-    todo = [k for k in job["clips"] if k.get("status") == "queued"]
+    todo = [k for k in job["clips"] if k.get("status") == "queued" and not k.get("candidate")]
     for k in todo:
         jobs.submit_live(lambda k=k: s._render(k))
 

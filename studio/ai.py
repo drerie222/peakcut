@@ -12,6 +12,10 @@ The others are told the schema in the prompt and asked for a JSON object, which 
 One picture can also be shown (`see`), which is how the webcam is looked for on a gaming stream. A model that
 cannot look at pictures answers with something else, and that is simply taken as "it did not look"."""
 import base64
+import collections
+import copy
+import hashlib
+import time
 import json
 import os
 import re
@@ -19,7 +23,7 @@ import threading
 
 import httpx
 
-from . import config, load
+from . import ai_limits, config, ctx
 
 # name -> (label shown on the pages, address, how it is spoken to, where to get a key, an example model id)
 PROVIDERS = {
@@ -160,7 +164,7 @@ def list_models(provider_id=None, address=None, with_key=None) -> list:
     else:
         r = httpx.get(f"{base}/models", headers={"Authorization": f"Bearer {k}"} if k else {}, timeout=20)
     if r.status_code != 200:
-        raise AIError(f"HTTP {r.status_code} {r.text[:200].replace(k or chr(0), '<key>')}")
+        raise AIError(f"HTTP {r.status_code} from the model catalogue.")
     data = r.json()
     if how == "gemini":
         found = [m.get("name", "").split("/")[-1] for m in data.get("models", [])
@@ -213,8 +217,7 @@ def clear_problem():
 
 
 def _fail(r, model):
-    text = r.text[:300].replace(key() or "\0", "<key>")
-    raise AIError(f"HTTP {r.status_code} {text}")
+    raise AIError(f"HTTP {r.status_code} from the AI service.")
 
 
 # ---------------------------------------------------------------- the schema, said in words for chat models
@@ -291,18 +294,72 @@ def _parse(text):
     return out
 
 
+_responses = collections.OrderedDict()
+_response_lock = threading.Lock()
+_inflight = {}
+
+
+def _cached(model, prompt, payload, send):
+    cfg = current()
+    if cfg["provider"] != "gemini":
+        return send()
+    scope = ai_limits.limiter.scope(cfg["provider"], base_url(), cfg["key"], model)
+    digest = hashlib.sha256(payload).digest()
+    cache_key = (ctx.uid_or_none(), scope, hashlib.sha256(prompt.encode()).digest(), digest)
+    with _response_lock:
+        cached = _responses.get(cache_key)
+        if cached and cached[0] > time.monotonic():
+            _responses.move_to_end(cache_key)
+            return copy.deepcopy(cached[1]), 0, 0
+        if cache_key in _inflight:
+            raise ai_limits.Deferred("duplicate_in_flight", time.time() + 10)
+        _inflight[cache_key] = True
+    try:
+        answer, sent, wrote = send()
+        if len(str(answer)) < 24000:
+            with _response_lock:
+                _responses[cache_key] = (time.monotonic() + 300, copy.deepcopy(answer))
+                _responses.move_to_end(cache_key)
+                while len(_responses) > 48:
+                    _responses.popitem(last=False)
+        return answer, sent, wrote
+    finally:
+        with _response_lock:
+            _inflight.pop(cache_key, None)
+
+
+def _post(model, url, *, json, headers, timeout):
+    # The inline image is counted separately, so Base64 is not mistaken for prompt tokens.
+    text_size = 0
+    image_tokens = 0
+    for message in json.get("contents", json.get("messages", [])):
+        parts = message.get("parts", message.get("content", ""))
+        if isinstance(parts, str):
+            text_size += len(parts.encode())
+        else:
+            for part in parts:
+                text_size += len(part.get("text", "").encode())
+                if any(name in part for name in ("inline_data", "image_url", "source")):
+                    image_tokens += 1024
+    schema = json.get("generationConfig", {}).get("responseSchema")
+    if schema:
+        text_size += len(str(schema))
+    estimated = max(1, (text_size + 2) // 3) + image_tokens
+    return ai_limits.limiter.request(provider(), base_url(), key(), model, estimated,
+                                     lambda: httpx.post(url, json=json, headers=headers, timeout=timeout))
+
+
 # ---------------------------------------------------------------- one call
-@load.serial_ai
 def call(model: str, prompt: str, schema: dict, timeout: float | None = None):
     """Ask one model. Returns (the parsed JSON answer, tokens sent, tokens written back).
 
     `timeout` is how long one answer may take. A live stream passes a short one, because a slow
     answer must not stop the recording."""
     how = PROVIDERS[provider()][2]
-    return {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how](model, prompt, schema, timeout)
+    send = {"gemini": _gemini, "openai": _openai, "anthropic": _anthropic}[how]
+    return _cached(model, prompt, json.dumps(schema, sort_keys=True).encode(), lambda: send(model, prompt, schema, timeout))
 
 
-@load.serial_ai
 def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, int, int]:
     """Ask one model about one picture: (the answer as text, tokens in, tokens out).
 
@@ -311,14 +368,33 @@ def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, i
     it. The picture is a JPEG, passed as base64 inside the ordinary message."""
     if not ready() or not image or not models():
         return "", 0, 0
-    model = models()[0]
+    errors = []
+    deadline = time.monotonic() + (timeout or 20)
+    for model in models():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            errors.append(ai_limits.Deferred("vision_deadline", time.time() + 20))
+            break
+        try:
+            result = _cached(model, prompt, image, lambda: _see(model, prompt, image, remaining))
+            clear_problem()
+            return result
+        except (AIError, ai_limits.Deferred) as exc:
+            errors.append(exc)
+    deferred = [exc for exc in errors if isinstance(exc, ai_limits.Deferred)]
+    if deferred:
+        raise min(deferred, key=lambda exc: exc.retry_at)
+    raise errors[-1] if errors else AIError("No configured image model answered.")
+
+
+def _see(model, prompt, image, timeout):
     b64 = base64.b64encode(image).decode()
     how = PROVIDERS[provider()][2]
     if how == "gemini":
         body = {"contents": [{"role": "user", "parts": [
             {"text": prompt},
             {"inline_data": {"mimeType": "image/jpeg", "data": b64}}]}]}
-        r = httpx.post(f"{base_url()}/{model}:generateContent", json=body,
+        r = _post(model, f"{base_url()}/{model}:generateContent", json=body,
                        headers={"x-goog-api-key": key()}, timeout=timeout or 120)
         if r.status_code != 200:
             _fail(r, model)
@@ -331,7 +407,7 @@ def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, i
         body = {"model": model, "max_tokens": 300, "messages": [{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
             {"type": "text", "text": prompt}]}]}
-        r = httpx.post(f"{base_url()}/messages", json=body, timeout=timeout or 120,
+        r = _post(model, f"{base_url()}/messages", json=body, timeout=timeout or 120,
                        headers={"x-api-key": key(), "anthropic-version": "2023-06-01"})
         if r.status_code != 200:
             _fail(r, model)
@@ -343,7 +419,7 @@ def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, i
     body = {"model": model, "stream": False, "messages": [{"role": "user", "content": [
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}]}]}
-    r = httpx.post(f"{base_url()}/chat/completions", json=body, headers=headers, timeout=timeout or 120)
+    r = _post(model, f"{base_url()}/chat/completions", json=body, headers=headers, timeout=timeout or 120)
     if r.status_code != 200:
         _fail(r, model)
     data = _openai_body(r)
@@ -355,7 +431,7 @@ def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, i
 def _gemini(model, prompt, schema, timeout=None):
     body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json", "responseSchema": schema}}
-    r = httpx.post(f"{base_url()}/{model}:generateContent", json=body, headers={"x-goog-api-key": key()}, timeout=timeout or 120)
+    r = _post(model, f"{base_url()}/{model}:generateContent", json=body, headers={"x-goog-api-key": key()}, timeout=timeout or 120)
     if r.status_code != 200:
         _fail(r, model)
     data = r.json()
@@ -423,7 +499,7 @@ def _openai(model, prompt, schema, timeout=None):
     extras = [{"temperature": 0.4, "response_format": {"type": "json_object"}}, {"response_format": {"type": "json_object"}}, {}]
     r = None
     for extra in extras:
-        r = httpx.post(f"{base_url()}/chat/completions", json={**body, **extra}, headers=headers, timeout=timeout or 180)
+        r = _post(model, f"{base_url()}/chat/completions", json={**body, **extra}, headers=headers, timeout=timeout or 180)
         if r.status_code not in (400, 422):
             break
     if r.status_code != 200:
@@ -435,7 +511,7 @@ def _openai(model, prompt, schema, timeout=None):
 
 def _anthropic(model, prompt, schema, timeout=None):
     body = {"model": model, "max_tokens": 8192, "messages": [{"role": "user", "content": _wrapped(prompt, schema)}]}
-    r = httpx.post(f"{base_url()}/messages", json=body, timeout=timeout or 180,
+    r = _post(model, f"{base_url()}/messages", json=body, timeout=timeout or 180,
                    headers={"x-api-key": key(), "anthropic-version": "2023-06-01"})
     if r.status_code != 200:
         _fail(r, model)

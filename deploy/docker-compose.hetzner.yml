@@ -1,12 +1,20 @@
 # Single-owner test server. Compose 2.24.4+ is required for !reset.
+x-bounded-logs: &bounded-logs
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
 services:
   db:
+    logging: *bounded-logs
     cpus: 0.30
     mem_limit: 384m
     memswap_limit: 384m
     command: ["postgres", "-c", "max_connections=20", "-c", "shared_buffers=64MB",
               "-c", "effective_cache_size=256MB", "-c", "work_mem=2MB", "-c", "maintenance_work_mem=32MB"]
   app:
+    logging: *bounded-logs
     ports: !reset []
     cpus: 1.50
     mem_limit: 2816m
@@ -33,6 +41,7 @@ services:
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "1"
   caddy:
+    logging: *bounded-logs
     cpus: 0.15
     mem_limit: 96m
     memswap_limit: 96m

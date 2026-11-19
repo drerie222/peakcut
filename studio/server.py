@@ -74,7 +74,8 @@ def _startup():
     jobs.start()
     discord_clips.start()
     live.start()
-    from . import storage
+    from . import candidates, storage
+    candidates.start()
     storage.start()
     posting.start()
     from . import updates
@@ -943,6 +944,17 @@ def upload_cancel(upid: str):
     return {"ok": True}
 
 
+@app.post("/api/jobs/{jid}/candidates/{cid}/retry")
+def retry_candidate(jid: str, cid: str):
+    from . import candidates
+
+    job = _job_or_404(jid)
+    _throttle("candidate:" + ctx.uid(), 12, 600, "Wait before retrying another highlight.")
+    if not candidates.retry(job, cid):
+        raise HTTPException(409, "This highlight cannot be retried from retained media.")
+    return jobs.public(job)
+
+
 @app.post("/api/jobs/{jid}/clips/{cid}/render")
 def rerender(jid: str, cid: str, body: dict = Body(...)):
     job = _job_or_404(jid)
@@ -1285,7 +1297,8 @@ def clip_now(jid: str, body: dict = Body(...)):
 # ================================================================ AI usage
 @app.get("/api/usage")
 def ai_usage():
-    return usage.summary({c["id"]: c["name"] for c in creators.all_creators()})
+    return {**usage.summary({c["id"]: c["name"] for c in creators.all_creators()}),
+            "service": ai.ai_limits.limiter.status(), "live_render_waiting": jobs.live_waiting()}
 
 
 # ---------------------------------------------------------------- the AI key and model, set from the dashboard
@@ -1511,6 +1524,17 @@ def add_posts(body: dict = Body(...)):
     return {"queued": len(made)}
 
 
+@app.post("/api/admin/buffer/check")
+def check_buffer_channel(request: Request):
+    _admin(request)
+    _throttle("buffer-check:" + ctx.uid(), 6, 60, "Wait before checking Buffer again.")
+    try:
+        return buffer.check_channel()
+    except buffer.Error as exc:
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+        raise HTTPException(exc.status, str(exc), headers=headers) from None
+
+
 def _buffer_clip(request: Request, jid: str, cid: str):
     _admin(request)
     job = _job_or_404(jid)
@@ -1538,6 +1562,9 @@ def save_buffer_draft(request: Request, jid: str, cid: str, body: dict = Body(de
             ctx.bump()
         headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
         raise HTTPException(exc.status, str(exc), headers=headers) from None
+    if result.get("state") == "draft" and clip.get("watch_export"):
+        clip["watch_export"].update(state="draft", error="")
+        jobs.save(job)
     ctx.bump()
     return result
 
