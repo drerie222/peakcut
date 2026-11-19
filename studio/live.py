@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import alerts, auth, brain, config, creators, ctx, facecam, games, jobs, load, media, speaker, transcribe, usage
+from . import alerts, auth, brain, config, creators, ctx, facecam, games, jobs, load, media, render, speaker, transcribe, usage
 
 # ":username!user@host PRIVMSG #channel :the message"
 _NICK = re.compile(r"(?m)^:([A-Za-z0-9_]{2,25})!")
@@ -653,11 +653,12 @@ class Session:
 
     def _retain_highlight(self, start, end, peak, signal):
         from . import candidates
+        settings = dict(self.settings, layout=self._clip_layout())
         self._scan_segments()
         with self.lock:
             if self.segments and self.segments[-1][2] < end and not self.ended:
                 return None  # the last segment hasn't been closed by FFmpeg yet
-            return candidates.enqueue(self.job, self.settings, self.segments, start, end, peak, signal)
+            return candidates.enqueue(self.job, settings, self.segments, start, end, peak, signal)
 
     def _verdict(self, v, result):
         self.verdicts.append(dict(v, result=result))
@@ -711,9 +712,13 @@ class Session:
                 c["reason"] = req["why"]
             self._add_clip(c)
 
+    def _clip_layout(self):
+        gaming = bool(self._game() or self.settings.get("watchlist") or speaker.protected(self.job, self.settings))
+        return render.choose_layout(creators.layout_preference(self.settings), gaming)
+
     def _add_clip(self, c):
         self.n += 1
-        c.update(id=f"clip{self.n:03d}", style=self.settings["style"], layout=self.settings["layout"],
+        c.update(id=f"clip{self.n:03d}", style=self.settings["style"], layout=self._clip_layout(),
                  captions=self.job["options"].get("captions", True), status="queued", version=0, made_at=time.time())
         with self.lock:
             self.job["clips"].append(c)
@@ -760,7 +765,7 @@ class Session:
             clip["mic_track"] = 2
         else:
             clip.pop("mic_track", None)
-        if clip.get("layout") == "gameplay":
+        if clip.get("layout") in render.GAMEPLAY_LAYOUTS:
             if self.facecam_part != parts or not self.facecam_box:
                 self.facecam_box = self._find_facecam(src)
                 self.facecam_part = parts

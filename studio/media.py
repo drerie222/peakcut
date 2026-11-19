@@ -302,9 +302,15 @@ def probe(path: Path) -> dict:
     if w * h > 3840 * 2160 or w < 16 or h < 16:
         raise RuntimeError("This video's resolution isn't supported (4K is the largest).")
     rot = str((v.get("side_data_list") or [{}])[0].get("rotation", "0"))
-    if rot.lstrip("-") in ("90", "270"):
+    rotated = rot.lstrip("-") in ("90", "270")
+    if rotated:
         w, h = h, w
-    return {"width": w, "height": h, "duration": float(data["format"]["duration"])}
+    info = {"width": w, "height": h, "duration": float(data["format"]["duration"])}
+    sar = re.fullmatch(r"([1-9]\d*):([1-9]\d*)", v.get("sample_aspect_ratio") or "")
+    if sar and sar[1] != sar[2]:
+        a, b = map(int, sar.groups())
+        info["sample_aspect"] = b / a if rotated else a / b
+    return info
 
 
 

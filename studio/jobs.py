@@ -108,7 +108,7 @@ _by_user: dict = {}                       # user -> {job id: job}: listing one p
 _lock = threading.RLock()
 on_clip_ready: list = []   # callbacks (job, clip), run once when a clip first finishes
 
-DEFAULTS = {"max_clips": 6, "min_len": 15, "max_len": 60, "style": "bounce", "layout": "blur", "quality": 720,
+DEFAULTS = {"max_clips": 6, "min_len": 15, "max_len": 60, "style": "bounce", "layout": "auto", "quality": 720,
             "range_start": None, "range_end": None, "captions": True}
 
 
@@ -132,7 +132,7 @@ def clean_options(options) -> dict:
         elif k == "style":
             v = v if v in render.STYLES else DEFAULTS["style"]
         elif k == "layout":
-            v = v if v in render.LAYOUTS else DEFAULTS["layout"]
+            v = v if v in render.LAYOUTS else "auto"
         else:                                    # range_start, range_end: seconds into the video
             v = float(v)
             if not math.isfinite(v) or v < 0:
@@ -300,9 +300,12 @@ def create(source: dict, options: dict, enqueue=True, creator=None, kind="video"
     if c:
         d = creators.root(c["id"]) / ("live" if kind == "live" else "videos") / jid
         base = {**DEFAULTS, **{k: c[k] for k in ("max_clips", "min_len", "max_len", "style", "layout", "captions")}}
+        base["layout"] = creators.layout_preference(c)
     else:
         d, base, creator = config.user_dir(ctx.uid()) / "jobs" / jid, dict(DEFAULTS), None
     opts = {**base, **clean_options(options)}
+    if c and c.get("watchlist"):
+        opts["layout"] = render.choose_layout(opts["layout"], gaming=True)
     if opts["min_len"] >= opts["max_len"]:
         opts["min_len"] = max(5, opts["max_len"] - 5)
     job = {"id": jid, "user": ctx.uid(), "kind": kind, "creator": creator, "dir": str(d), "created": time.time(), "source": source,
@@ -411,7 +414,7 @@ def _request_render(jid, cid, changes):
     if new.get("style") not in render.STYLES:
         new["style"] = DEFAULTS["style"]
     if new.get("layout") not in render.LAYOUTS:
-        new["layout"] = DEFAULTS["layout"]
+        new["layout"] = render.choose_layout(clip.get("layout"), speaker.protected(job, clip))
     clip.update(new, status="queued")
     save(job)
     _q.put(("clip", jid, cid))
@@ -431,19 +434,25 @@ def render_one(job, clip, words, *, verified_mic=False):
             clip["end"] = min(clip["end"], job["duration"])
         gameplay = speaker.protected(job, clip)
         source_issue = None
+        render_options = {}
         clip.pop("trimmed_opening", None)
         if gameplay:
             clip["gameplay_source"] = True
-            source_issue = _prepare_gameplay(job, clip, src, off)
             info = media.probe(src)
             width, height = info["width"], info["height"]
             old_crop = clip.get("version", 0) and not clip.get("quality")
-            if clip.get("layout") == "gameplay" and (old_crop or not (clip.get("facecam") or clip.get("facecam_checked"))):
+            if clip.get("layout") in render.GAMEPLAY_LAYOUTS and (old_crop or not (clip.get("facecam") or clip.get("facecam_checked"))):
                 clip.pop("facecam", None)
                 box = _facecam(job, src)
                 if box:
                     clip["facecam"] = box
                 clip["facecam_checked"] = True
+            if clip.get("layout") == render.FULL_GAMEPLAY:
+                mask = render.gameplay_mask(clip.get("facecam"), width, height)
+                source_issue = _prepare_gameplay(job, clip, src, off, strict=True, mask=mask)
+                render_options["sar"] = info.get("sample_aspect", 1.0)
+            else:
+                source_issue = _prepare_gameplay(job, clip, src, off)
             if not clip.get("captions", True):
                 words, clip["speech_source"] = [], "disabled"
             elif verified_mic and not clip.get("src"):
@@ -457,18 +466,24 @@ def render_one(job, clip, words, *, verified_mic=False):
             clip["highlight_words"] = []   # a visual description must not highlight words from the programme mix
         else:
             width, height = job["width"], job["height"]
-        local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
+        hook = clip.get("hook") or ""
+        if not hook and clip.get("layout") == render.FULL_GAMEPLAY:
+            hook = speaker.hook({"hook": clip.get("title")})
+        local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(hook))
         near = _caption_words(job, clip, words, off) if clip.get("captions", True) else []
         started = time.monotonic()
         try:
-            out = render.render_clip(src, d / "clips", clip["id"], local, near, width, height)
+            out = render.render_clip(src, d / "clips", clip["id"], local, near, width, height, **render_options)
         finally:
             add_timing(job, "render", time.monotonic() - started)
         version = clip.get("version", 0) + 1
         if gameplay:
-            clip["quality"] = quality.review(d / "clips" / out["file"], clip, version, gameplay=True,
+            clip["quality"] = quality.review(d / "clips" / out["file"], {**clip, **out}, version, gameplay=True,
                                              source_issue=source_issue or quality.gameplay_issue(src, clip, off))
         clip.update(out, status="done", version=version, error=None)
+        if clip.get("layout") != render.FULL_GAMEPLAY:
+            clip.pop("gameplay_region", None)
+            clip.pop("gameplay_mask", None)
         post = {k: clip[k] for k in ("title", "description", "hashtags", "hook", "start", "end", "score")}
         (d / "clips" / f"{clip['id']}.json").write_text(json.dumps(post, indent=1), encoding="utf-8")
         if clip["version"] == 1:
@@ -489,9 +504,10 @@ def render_one(job, clip, words, *, verified_mic=False):
     save(job)
 
 
-def _prepare_gameplay(job, clip, src, offset):
+def _prepare_gameplay(job, clip, src, offset, *, strict=False, mask=None):
     span = clip["end"] - clip["start"]
-    advance = quality.opening(src, clip["start"] - offset, span)
+    options = {"strict": True, "mask": mask} if strict else {}
+    advance = quality.opening(src, clip["start"] - offset, span, **options)
     if advance is None:
         return "No clear video was found at the start of the selected cut."
     if advance:
@@ -721,6 +737,7 @@ def _run_job(job):
         if not job.get("thumb") and media.save_thumb(d, video=audio_file):
             _set(job, thumb=True)
     gameplay = speaker.protected(job, o)
+    o["layout"] = render.choose_layout(o["layout"], gaming=gameplay)
     mic = speaker.declared_track(job.get("game_mic_track")) if gameplay and src["type"] == "file" else None
     wav = d / "audio.wav"
     try:
@@ -916,11 +933,11 @@ def _run_job(job):
                 c.setdefault("evidence", "isolated_mic")
             # Only the gameplay layout uses a webcam, so it is only looked for then, and only once: a
             # stream with no webcam is not looked for again on every clip of it.
-            if o["layout"] == "gameplay" and face is False:
+            if o["layout"] in render.GAMEPLAY_LAYOUTS and face is False:
                 face = _facecam(job)
             if face:
                 c["facecam"] = face
-            if o["layout"] == "gameplay" and face is not False:
+            if o["layout"] in render.GAMEPLAY_LAYOUTS and face is not False:
                 c["facecam_checked"] = True
             job["clips"].append(c)
             block_clips.append(c)

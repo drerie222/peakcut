@@ -14,7 +14,7 @@ def _root() -> Path:
 
 _lock = threading.RLock()
 
-DEFAULTS = {"name": "", "channel": "", "style": "bounce", "layout": "blur", "captions": True, "min_len": 15, "max_len": 60,
+DEFAULTS = {"name": "", "channel": "", "style": "bounce", "layout": "auto", "captions": True, "min_len": 15, "max_len": 60,
             "max_clips": 6, "min_score": 80, "auto_watch": False, "buffer_min": 20, "live_per_hour": 4, "ai_every_min": 3, "ai_only_on_spike": True, "auto_jump_pct": 60,
             "plan": "free", "decide_mode": "both", "must_clip_min": 0, "min_gap_min": 2,
             "game": "", "game_mic_track": 0,
@@ -22,6 +22,13 @@ DEFAULTS = {"name": "", "channel": "", "style": "bounce", "layout": "blur", "cap
             "autopost": False, "accounts": [], "post_min_score": 75, "post_gap_min": 45, "daily_cap": 6,
             "privacy": "public", "post_footer": "", "rate_per_1k": 0.0, "channels": {}}
 PLATFORMS = ("youtube", "twitch", "kick")
+
+
+def layout_preference(creator):
+    layout = creator.get("layout", "auto")
+    if layout == "gameplay" and creator.get("watchlist") and not creator.get("layout_selected"):
+        return "auto"  # old watchlist presets predate the new default
+    return layout
 
 
 def platform_key(url: str) -> str:
@@ -149,6 +156,8 @@ def create(data: dict, *, watchlist=None) -> dict:
     while root(cid).exists():
         cid, n = f"{slug}-{n}", n + 1
     c.update(id=cid, created=time.time())
+    if "layout" in data:
+        c["layout_selected"] = True
     if watchlist:
         c["watchlist"] = watchlist
     _write(c)
@@ -167,6 +176,8 @@ def update(cid, data: dict) -> dict:
     if "channel" in new and new["channel"] and "channels" not in new:
         new["channels"] = {**c["channels"], platform_key(new["channel"]): new["channel"]}
     c.update(new)
+    if "layout" in new:
+        c["layout_selected"] = True
     _fix(c)
     if "watch_priority" in data:
         priority = data["watch_priority"]

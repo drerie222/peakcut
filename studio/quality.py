@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from . import config, load, media
+from .render import FULL_GAMEPLAY
 
 _FFMPEG = "ffmpeg"
 
@@ -35,13 +36,24 @@ _SAMPLE_FPS, _WIDTH, _HEIGHT = 8, 64, 64
 
 
 @load.serial_work
-def samples(path, start, seconds):
+def samples(path, start, seconds, *, region=None, mask=None, native=False):
     """Decode a bounded window. A six-second check produces less than 200 KiB."""
+    filters = []
+    if region:
+        x, y, w, h = region
+        filters.append(f"crop={w}:{h}:{x}:{y}")
+    if mask:
+        x, y, w, h = mask
+        filters.append(f"drawbox=x=iw*{x:.6f}:y=ih*{y:.6f}:w=iw*{w:.6f}:h=ih*{h:.6f}:color=black:t=fill")
+    if not native:
+        filters.append(f"fps={_SAMPLE_FPS}")
+    filters.extend((f"scale={_WIDTH}:{_HEIGHT}:flags=area", "format=gray"))
+    cap = ["-frames:v", "3"] if native else []
     try:
         data = subprocess.run(
             [_FFMPEG, "-v", "error", "-ss", f"{max(0, start):.3f}", *load.ffmpeg_threads(), "-i", str(path),
              "-t", f"{seconds:.3f}", "-filter_threads", "1", "-map", "0:v:0", "-vf",
-             f"fps={_SAMPLE_FPS},scale={_WIDTH}:{_HEIGHT}:flags=area,format=gray", "-an", "-c:v", "rawvideo",
+             ",".join(filters), *cap, "-an", "-c:v", "rawvideo",
              "-threads", "1", "-f", "rawvideo", "-"],
             capture_output=True, timeout=20, check=True,
         ).stdout
@@ -56,12 +68,14 @@ def _visible(frames):
     return np.count_nonzero(frames > 26, axis=1) >= frames.shape[1] * 0.08
 
 
-def opening(path, start, duration):
+def opening(path, start, duration, *, strict=False, mask=None):
     """Seconds to the first sustained visible frame, or None when the opening cannot be cleared."""
-    frames = samples(path, start, min(6.0, duration))
+    frames = samples(path, start, min(6.0, duration), **({"mask": mask} if mask else {}))
     visible = _visible(frames)
     for index in range(min(len(visible) - 2, 4 * _SAMPLE_FPS + 1)):
         if visible[index:index + 3].all():
+            if index == 0 and strict and not _clear_opening(samples(path, start, min(3.0, duration), mask=mask, native=True)):
+                continue
             return (index + 1) / _SAMPLE_FPS if index else 0.0
     return None
 
@@ -71,6 +85,10 @@ def _moving(frames):
         return False
     differences = np.abs(np.diff(frames.astype(np.int16), axis=0))
     return bool((np.count_nonzero(differences > 10, axis=1) >= frames.shape[1] * 0.01).sum() >= 2)
+
+
+def _clear_opening(frames):
+    return len(frames) >= 3 and _visible(frames[:3]).all()
 
 
 def review(path, clip, version, *, gameplay=False, source_issue=None):
@@ -89,12 +107,20 @@ def review(path, clip, version, *, gameplay=False, source_issue=None):
                 or abs(duration - expected) > max(0.65, min(1.5, expected * 0.04))):
             issues.append("The rendered duration does not match the selected cut.")
             return {"version": version, "revision": REVIEW_REVISION, "issues": issues}
-        first = samples(path, 0, min(1.0, duration))
-        visible = _visible(first)
-        if len(visible) < 3 or not visible[:3].all():
+        opts = {}
+        if clip.get("layout") == FULL_GAMEPLAY:
+            region = clip.get("gameplay_region")
+            if (not isinstance(region, (list, tuple)) or len(region) != 4
+                    or not all(type(value) is int and value >= 0 for value in region)
+                    or not (0 < region[2] <= config.OUT_W - region[0] and 0 < region[3] <= config.OUT_H - region[1])):
+                issues.append("The rendered gameplay area could not be checked.")
+                return {"version": version, "revision": REVIEW_REVISION, "issues": issues}
+            opts = {"region": region, "mask": clip.get("gameplay_mask")}
+        first = samples(path, 0, min(3.0 if opts else 1.0, duration), **({**opts, "native": True} if opts else {}))
+        if not _clear_opening(first):
             issues.append("The opening frames are black or unreadable.")
         if gameplay and duration >= 3:
-            middle = samples(path, duration * 0.5, min(1.5, duration * 0.4))
+            middle = samples(path, duration * 0.5, min(1.5, duration * 0.4), **opts)
             if not _visible(middle).any():
                 issues.append("Gameplay is black or unreadable midway through the clip.")
     return {"version": version, "revision": REVIEW_REVISION, "issues": issues}

@@ -4,13 +4,14 @@ import tempfile
 from pathlib import Path
 
 from . import media, transcribe
+from .render import GAMEPLAY_LAYOUTS
 
 _QUOTE = re.compile(r"""["“”«»]|(?:^|\s)['‘][^\n]+['’](?:\s|$)|\b(?:I|ME|MY|MINE|WE|OUR)\b""", re.I)
 
 
 def protected(job, clip):
     return bool(job.get("watch_broadcast") or job.get("game") or clip.get("gameplay_source")
-                or clip.get("layout") == "gameplay" or job.get("options", {}).get("layout") == "gameplay")
+                or clip.get("layout") in GAMEPLAY_LAYOUTS or job.get("options", {}).get("layout") in GAMEPLAY_LAYOUTS)
 
 
 def declared_track(value):
