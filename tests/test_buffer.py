@@ -200,7 +200,10 @@ def main():
 
 
 try:
-    main()
+    # These tests use sentinel bytes to verify the HTTP range and revocation behavior.
+    # test_clip_quality exercises preflight with real FFmpeg output.
+    with patch.object(buffer.quality, "review", return_value={"issues": []}):
+        main()
 finally:
     db.engine.dispose()
     data.cleanup()

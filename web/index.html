@@ -1864,6 +1864,7 @@ function drawCreatorForm() {
         <label class="f">Caption style<select data-k="style" data-caption-style ${c.captions === false ? "disabled" : ""}>${opts(S.status.styles, c.style)}</select></label>
         <label class="f">Layout<select data-k="layout">${opts(S.status.layouts, c.layout)}</select></label>
         <label class="f">Game<input data-k="game" value="${esc(c.game || "")}" placeholder="Read from the title"><small class="sub" style="font-weight:400">Left empty, the game is read from the stream's title. Set it for a streamer whose title says nothing: GTA 6, Fortnite, Elden Ring.</small></label>
+        <label class="f">Isolated streamer microphone<select data-k="game_mic_track">${opts({0:"Off · mixed or unknown audio",2:"Audio track 2",3:"Audio track 3",4:"Audio track 4",5:"Audio track 5",6:"Audio track 6",7:"Audio track 7",8:"Audio track 8"}, c.game_mic_track || 0)}</select><small class="sub" style="font-weight:400">Only select a separate track you know contains the streamer microphone alone. Unknown voices get no captions.</small></label>
         <label class="f">Shortest clip (seconds)<input data-k="min_len" type="number" value="${c.min_len}"></label>
         <label class="f">Longest clip (seconds)<input data-k="max_len" type="number" value="${c.max_len}"></label>
         <label class="f">Clips per video<input data-k="max_clips" type="number" value="${c.max_clips}"></label>
@@ -2146,7 +2147,7 @@ function drawBufferDraft(c) {
     ${!draft ? "" : draft.state === "draft" ? `<p class="help">Buffer status: ${esc(draft.publication?.replaceAll("_", " ") || "draft")}.</p>
       <button class="btn" data-act="buffer-refresh">Check publication status</button>`
       : draft.state === "unconfirmed" ? `<p class="help">Check the draft in Buffer before trying again.</p>`
-      : c.status === "done" ? `<button class="btn" data-act="buffer-save">Save TikTok draft</button>` : ""}
+      : c.status === "done" && !c.quality?.issues?.length ? `<button class="btn" data-act="buffer-save">Save TikTok draft</button>` : ""}
     ${draft?.video_link ? `<button class="btn" data-act="buffer-revoke">Revoke Buffer video link</button>` : ""}`);
 }
 async function loadBufferDraft() {
@@ -2183,6 +2184,7 @@ function drawClipDlg(full) {
         <label class="f">Description<textarea data-f="description" rows="2">${esc(c.description)}</textarea></label>
         ${c.raw_expired ? '<p class="help">The raw recording has expired. The finished clip is still available.</p>'
           : `<button class="btn" data-act="remake">${ic("scissors")}Save and re-make clip</button>`}
+        <div id="clip-quality"></div>
         <h3>${S.status.draft_only ? "Review and export" : "Post it"}</h3>
         <div id="dposts" class="row" style="gap:4px"></div>
         ${S.status.draft_only ? "" : S.accounts.length ? `<div class="row">${S.accounts.map(a => `<label class="ck"><input type="checkbox" data-pacc value="${esc(a.id)}">${esc(a.label)} · ${esc(a.name)}</label>`).join("")}</div>
@@ -2195,6 +2197,11 @@ function drawClipDlg(full) {
       </div></div>`;
   } else if (D.sig !== sig) $("#stage").innerHTML = stage;
   D.sig = sig;
+  put($("#clip-quality"), c.status !== "done" ? "" : [
+    c.quality?.issues?.length ? `<p class="err">Draft held. ${esc(c.quality.issues.join(" "))}</p>` : "",
+    c.speech_source === "mixed" ? '<p class="help">Captions withheld because the speaker cannot be verified from the available audio.</p>' : "",
+    c.speech_source === "mic_unavailable" ? '<p class="help">Captions withheld because the isolated microphone track could not be read.</p>' : "",
+  ].join(""));
   put($("#dposts"), postPills(c));
   drawBufferDraft(c);
 }
@@ -2233,6 +2240,7 @@ function drawWatchlist() {
       const drafts = clips.filter(k => k.watch_export?.state === "draft" && k.buffer_remote_status !== "sent").length;
       const sent = clips.filter(k => k.buffer_remote_status === "sent").length;
       const exports = clips.filter(k => k.watch_export?.state === "queued").length;
+      const held = clips.filter(k => k.watch_export?.state === "held").length;
       const decision = c.auto_watch ? S.watchDecisions?.[c.id] : null;
       return `<tr><td class="c-main" data-l="Streamer"><button class="lnk" data-act="go" data-v="c:${esc(c.id)}">${esc(c.name)}</button>
         <span class="sub">Priority ${esc(c.watchlist.priority)}</span></td>
@@ -2243,7 +2251,7 @@ function drawWatchlist() {
           ${decision.factors.map(([label, points]) => `<div class="sub">${esc(label)} · ${points > 0 ? "+" : ""}${points}</div>`).join("")}
           </details>` : ""}` : ""}</td>
         <td data-l="Highlights and clips"><span>${clips.filter(k => k.score > 0).length} highlights · ${done} ready · ${processing} processing</span>
-        ${drafts || exports || sent ? `<span class="sub">${drafts} Buffer drafts · ${exports} waiting · ${sent} sent</span>` : ""}
+        ${drafts || exports || sent || held ? `<span class="sub">${drafts} Buffer drafts · ${exports} waiting · ${held} held · ${sent} sent</span>` : ""}
         ${lastError ? `<span class="err">${esc(lastError)}</span>` : ""}</td>
         <td class="c-act"><div class="row"><button class="btn sm" data-act="watch-toggle" data-c="${esc(c.id)}"
           aria-label="${c.auto_watch ? "Disable" : "Enable"} ${esc(c.name)}">${c.auto_watch ? "Disable" : "Enable"}</button>

@@ -18,15 +18,102 @@ video, and clips are then checked against that map.
 from __future__ import annotations
 
 import re
+import math
 import subprocess
 from pathlib import Path
 
-from . import config, load
+import numpy as np
+
+from . import config, load, media
 
 _FFMPEG = "ffmpeg"
 
 _PTS = re.compile(r"pts_time:([0-9.]+)")
 _YAVG = re.compile(r"lavfi\.signalstats\.YAVG=([0-9.]+)")
+REVIEW_REVISION = 1
+_SAMPLE_FPS, _WIDTH, _HEIGHT = 8, 64, 64
+
+
+@load.serial_work
+def samples(path, start, seconds):
+    """Decode a bounded window. A six-second check produces less than 200 KiB."""
+    try:
+        data = subprocess.run(
+            [_FFMPEG, "-v", "error", "-ss", f"{max(0, start):.3f}", *load.ffmpeg_threads(), "-i", str(path),
+             "-t", f"{seconds:.3f}", "-filter_threads", "1", "-map", "0:v:0", "-vf",
+             f"fps={_SAMPLE_FPS},scale={_WIDTH}:{_HEIGHT}:flags=area,format=gray", "-an", "-c:v", "rawvideo",
+             "-threads", "1", "-f", "rawvideo", "-"],
+            capture_output=True, timeout=20, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return np.empty((0, _WIDTH * _HEIGHT), dtype=np.uint8)
+    size = _WIDTH * _HEIGHT
+    return np.frombuffer(data[:len(data) // size * size], dtype=np.uint8).reshape(-1, size)
+
+
+def _visible(frames):
+    # Reject nearly black frames while allowing dark scenes with visible foreground detail.
+    return np.count_nonzero(frames > 26, axis=1) >= frames.shape[1] * 0.08
+
+
+def opening(path, start, duration):
+    """Seconds to the first sustained visible frame, or None when the opening cannot be cleared."""
+    frames = samples(path, start, min(6.0, duration))
+    visible = _visible(frames)
+    for index in range(min(len(visible) - 2, 4 * _SAMPLE_FPS + 1)):
+        if visible[index:index + 3].all():
+            return (index + 1) / _SAMPLE_FPS if index else 0.0
+    return None
+
+
+def _moving(frames):
+    if len(frames) < 3:
+        return False
+    differences = np.abs(np.diff(frames.astype(np.int16), axis=0))
+    return bool((np.count_nonzero(differences > 10, axis=1) >= frames.shape[1] * 0.01).sum() >= 2)
+
+
+def review(path, clip, version, *, gameplay=False, source_issue=None):
+    """Preflight the finished asset. Results only apply to the version that was decoded."""
+    issues = [source_issue] if source_issue else []
+    try:
+        expected = float(clip["end"]) - float(clip["start"])
+        info = media.probe(path)
+    except Exception:  # invalid or missing media must never create a draft
+        issues.append("The video or audio track could not be read.")
+    else:
+        duration = info["duration"]
+        if (info["width"], info["height"]) != (config.OUT_W, config.OUT_H):
+            issues.append("The video is not 1080 × 1920.")
+        if (not math.isfinite(duration) or not math.isfinite(expected) or duration < 2.8
+                or abs(duration - expected) > max(0.65, min(1.5, expected * 0.04))):
+            issues.append("The rendered duration does not match the selected cut.")
+            return {"version": version, "revision": REVIEW_REVISION, "issues": issues}
+        first = samples(path, 0, min(1.0, duration))
+        visible = _visible(first)
+        if len(visible) < 3 or not visible[:3].all():
+            issues.append("The opening frames are black or unreadable.")
+        if gameplay and duration >= 3:
+            middle = samples(path, duration * 0.5, min(1.5, duration * 0.4))
+            if not _visible(middle).any():
+                issues.append("Gameplay is black or unreadable midway through the clip.")
+    return {"version": version, "revision": REVIEW_REVISION, "issues": issues}
+
+
+def gameplay_issue(path, clip, offset):
+    if clip.get("evidence") == "audio_only":
+        return "Only a sound spike was detected. This highlight needs visual confirmation."
+    if clip.get("score", 0) and clip.get("score", 0) < clip.get("quality_min_score", 65):
+        return "The highlight score is below the review threshold."
+    if (clip.get("score", 0) and clip.get("evidence") not in ("visual", "isolated_mic")
+            and clip.get("speech_source") != "isolated_mic"):
+        return "The highlight needs visual confirmation or verified streamer speech."
+    span = clip["end"] - clip["start"]
+    start = clip["start"] - offset
+    if span >= 3 and not any(_moving(samples(path, start + span * fraction, min(1.5, span / 3)))
+                             for fraction in (0.0, 0.45, 0.8)):
+        return "The selected gameplay appears frozen."
+    return None
 
 
 @load.serial_work

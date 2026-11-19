@@ -247,7 +247,14 @@ def poll(todo):
 
 def on_clip_ready(job, clip):
     if job.get("watch_broadcast") and accounts.settings()["watch_buffer"] and clip.get("score", 0) > 0:
-        clip["watch_export"] = {"state": "queued", "due": time.time(), "attempts": 0}
+        state = clip.get("watch_export", {}).get("state")
+        if state == "draft":
+            return
+        issues = buffer.review_issues(job, clip)
+        if issues:
+            clip["watch_export"] = {"state": "held", "error": " ".join(issues)}
+        elif state in (None, "held"):
+            clip["watch_export"] = {"state": "queued", "due": time.time(), "attempts": 0}
         jobs.save(job)
 
 
@@ -256,6 +263,11 @@ def _export(job, clip, state):
         return
     owner = auth.get_user(job["user"])
     if not owner or owner.disabled or not owner.is_admin:
+        return
+    issues = buffer.review_issues(job, clip)
+    if issues:
+        state.update(state="held", error=" ".join(issues))
+        jobs.save(job)
         return
     state["attempts"] += 1
     try:
