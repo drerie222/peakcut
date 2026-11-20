@@ -146,14 +146,18 @@ def test_render_and_export(owner, job):
     jpeg = facecam.frame_strip([(path, 0, 66)], (10, 30, 40))
     check("the visual judge gets a contact sheet from real video frames", jpeg[:2] == b"\xff\xd8")
     with patch.object(brain.ai, "see", return_value=(
-            '{"title":"The final stunt","score":95,"category":"clutch","reason":"A car clears the gap."}', 0, 0)):
+            '{"title":"The final stunt","score":95,"category":"clutch","reason":"A car clears the gap."}', 0, 0)) as vision:
         c, _ = brain.judge_gameplay(jpeg, 2, 63, job["title"], "gta6")
         check("the visual judge can return a scored 61-second GTA highlight", c["score"] == 95 and c["end"] - c["start"] == 61)
         s = live.SESSIONS[job["id"]]
         s.settings.update(min_gap_min=0)
-        with patch.object(s, "_add_clip") as add:
-            s._visual_highlight(0, 75, "Jump: chat", {})
-            check("the visual path avoids near-duplicate clips before spending another AI call", not add.called)
+        s.t_done = 66
+        s.segments = [(path, 0, 66)]
+        s.spike = {"t": 42, "why": "chat"}
+        with patch.object(s, "_retain_highlight", wraps=s._retain_highlight) as retain:
+            s._highlight_step(draining=True)
+            check("the visual path avoids near-duplicate clips before spending another AI call",
+                  retain.called and not job.get("candidates") and vision.call_count == 1)
     face = facecam.detect(path)
     check("the racing fixture's synthetic facecam is detected", bool(face) and face["corner"] == "top-left")
     if face:

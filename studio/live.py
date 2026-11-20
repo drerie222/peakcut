@@ -153,6 +153,7 @@ class Session:
         self.chat_total = 0
         self.chat_on = False
         self.last_check = 0.0
+        self.last_quiet_step = 0.0
         self.words_at_check = 0
         self.checks = 0
         self.rejected = 0
@@ -189,8 +190,10 @@ class Session:
             return
 
         def work():
+            from . import candidates
             try:
-                self._ai_check(window, why)
+                with candidates.request_budget(self.job):
+                    self._ai_check(window, why)
             except Exception as e:  # noqa: BLE001
                 self.job["ai"]["last_error"] = media_safe(e)
             finally:
@@ -205,8 +208,10 @@ class Session:
         picture. A stream where the webcam is a square picture along the right edge, or
         one where there is no webcam at all and the game has panels of its own, is told
         apart from a real camera by what moves: a person sits still, the game does not."""
+        from . import candidates
         try:
-            box = facecam.detect(src, ask=brain.look_for_facecam)
+            with candidates.request_budget(self.job):
+                box = facecam.detect(src, ask=brain.look_for_facecam)
         except Exception:  # noqa: BLE001 - a missing facecam is not a failure
             return None
         if not box or box.get("conf") != "high":
@@ -560,8 +565,7 @@ class Session:
             now = self.t_done
             ws = max(0.0, now - max(every, 3) * 60 - 90)  # each check overlaps the last by 90 s, so nothing falls between
         self.last_check = self.t_done
-        gameplay = bool(self._game() or speaker.protected(self.job, st))
-        win = [] if gameplay else [w for w in self.words if ws <= w["s"] <= now]
+        win = [w for w in self.words if ws <= w["s"] <= now]
         recent = [c for c in self.job["clips"] if c.get("score", 0) > 0 and time.time() - c.get("made_at", 0) < 3600]
         last_clip = max((c.get("made_at", 0) for c in self.job["clips"]), default=self.started_at)
         must = st["must_clip_min"] > 0 and time.time() - last_clip >= st["must_clip_min"] * 60
@@ -573,11 +577,8 @@ class Session:
         title, up = self.job["title"], self.job["uploader"]
         watch = bool(self.job.get("watch_broadcast"))
         if len(win) < 8:
-            before = self.WATCH_BEFORE if watch else self.AUTO_BEFORE
-            if gameplay and self._visual_highlight(ws, now, why, verdict, peak=window[0] + before if window else None):
-                return
             self.skipped += 1
-            return self._verdict(verdict, "No verified gameplay highlight" if gameplay else "Skipped: nobody talking")
+            return self._verdict(verdict, "AI not called: not enough speech")
         try:
             cands, tok = brain.judge_transcript(win, ws, now, title, up, st["min_len"], st["max_len"], self.job["clips"],
                                                 n=1 if every <= 2 else 2, must=must, game=self._game(),
@@ -590,8 +591,6 @@ class Session:
         keep = [c for c in cands if c["score"] >= (40 if must else st["min_score"])]
         verdict["transcript"] = max((c["score"] for c in cands), default=0)
         if not keep:
-            if watch and self._visual_highlight(ws, now, why, verdict):
-                return
             return self._verdict(verdict, "Words judge: nothing clip-worthy")
         z = brain.loud_zscore(np.array(self.db, dtype=np.float32))
         lo, hi = int(ws), int(now) + 1
@@ -636,29 +635,55 @@ class Session:
             if added >= (1 if every <= 2 else 2):
                 break
 
-    def _visual_highlight(self, start, end, why, verdict, peak=None):
-        """One image check around a strong reaction when the words didn't identify a moment."""
-        if not why or not why.startswith("Jump:"):
-            return False
-        if peak is None:
-            peak = start + (self.WATCH_BEFORE if self.job.get("watch_broadcast") else self.AUTO_BEFORE)
-        length = min(61, self.settings["max_len"])
-        a = max(start, peak - min(36, length * 0.6))
-        b = min(end, a + length)
-        if not a <= peak < b or b - a < self.settings["min_len"] or brain._overlaps(a, b, self.job["clips"]):
-            return False
-        if any(abs(a - c["start"]) < self.settings["min_gap_min"] * 60 for c in self.job["clips"]):
-            return False
-        return self._retain_highlight(a, b, peak, why)
+    def _highlight_step(self, *, draining=False):
+        """Use durable video windows for both jumps and scheduled quiet checks."""
+        if not self.segments:
+            return
+        watch = self.job.get("watch_broadcast")
+        after = self.WATCH_AFTER if watch else self.AUTO_AFTER
+        end = min(self.t_done, self.segments[-1][2])
+        first = self.segments[0][1]
+        length = max(75, self.settings["min_len"] + 10)
+        if self.spike:
+            peak = self.spike["t"]
+            if end < peak + after and not draining:
+                return
+            end = min(end, peak + after)
+            before = self.WATCH_BEFORE if watch else self.AUTO_BEFORE
+            start = max(first, min(peak - before, end - self.settings["min_len"] - 5))
+            signal = "Jump: " + self.spike["why"]
+            self.spike = None
+            quiet = False
+        else:
+            interval = max(config.LIVE_HIGHLIGHT_INTERVAL, int(self.settings["ai_every_min"] or 3) * 60)
+            wait = (length / 2 if draining else interval) if self.last_quiet_step else (30 if draining else length)
+            if end - self.last_quiet_step < wait:
+                return
+            self.last_quiet_step = end
+            start = max(first, end - length)
+            peak, signal, quiet = (start + end) / 2, "Scheduled review", True
+        if end - start >= max(12, self.settings["min_len"]) and start <= peak < end:
+            self._retain_highlight(round(start, 2), round(end, 2), round(peak, 2), signal, quiet=quiet)
 
-    def _retain_highlight(self, start, end, peak, signal):
+    def _retain_highlight(self, start, end, peak, signal, *, quiet=False):
         from . import candidates
         settings = dict(self.settings, layout=self._clip_layout())
-        self._scan_segments()
         with self.lock:
-            if self.segments and self.segments[-1][2] < end and not self.ended:
-                return None  # the last segment hasn't been closed by FFmpeg yet
-            return candidates.enqueue(self.job, settings, self.segments, start, end, peak, signal)
+            # Ten-second aggregates keep the context useful and exclude chat usernames or messages.
+            seconds = range(int(start), int(end), 10)
+            activity = []
+            has_chat = self.chat_on or self.chat_total
+            for second in seconds:
+                levels = self.db[second:min(second + 10, int(end))]
+                level = f"{max(levels) if levels else -100:.0f} dB peak"
+                if has_chat:
+                    count = sum(self.chat[t] for t in range(second, min(second + 10, int(end))))
+                    level += f", {count} chat messages"
+                activity.append(f"{max(0, second - start):.0f}s {level}")
+            signals = "; ".join(activity) + ("; chat unavailable" if not has_chat else "")
+            segments = list(self.segments)
+        return candidates.enqueue(self.job, settings, segments, start, end, peak, signal,
+                                  context={"quiet": quiet, "signals": signals})
 
     def _verdict(self, v, result):
         self.verdicts.append(dict(v, result=result))
@@ -691,6 +716,7 @@ class Session:
                             self.manual.append({"start": max(0.0, t - 30), "end": t + 2, "why": f'Someone said "{p}"'})
 
     def _manual_step(self):
+        from . import candidates
         with self.lock:
             ready = [m for m in self.manual if m["end"] <= self.t_done or self.ended]
         gameplay = bool(self._game() or speaker.protected(self.job, self.settings))
@@ -700,7 +726,8 @@ class Session:
                 text = " ".join(w["w"] for w in self.words if req["start"] <= w["s"] <= req["end"])
                 usage.set_context(self.job["creator"], self.job["title"] or "Live stream")
                 try:
-                    c = brain.describe(text, self.job["title"], self.job["uploader"], timeout=config.LIVE_AI_TIMEOUT)
+                    with candidates.request_budget(self.job):
+                        c = brain.describe(text, self.job["title"], self.job["uploader"], timeout=config.LIVE_AI_TIMEOUT)
                 except Exception as e:  # noqa: BLE001 - the local clip still renders if the optional AI fails
                     self.job["ai"]["last_error"] = str(e)[-200:]
             with self.lock:
@@ -744,8 +771,15 @@ class Session:
             meta = media.probe(segs[0][0])
             self.job.update(width=meta["width"], height=meta["height"])
         lst = self.dir / "clips" / f"{clip['id']}.txt"
-        lst.write_text("".join(f"file '{s[0].as_posix()}'\n" for s in segs), encoding="utf-8")
-        src = self.dir / "clips" / f"{clip['id']}.src.ts"
+        # A seekable container keeps the selected cut and its quality checks on the same clock.
+        indexed = clip.get("require_quality")
+        if indexed:
+            rows = [f"file '{path.as_posix()}'\nduration {b - a:.6f}\n" for path, a, b in segs]
+        else:
+            rows = [f"file '{path.as_posix()}'\n" for path, _, _ in segs]
+        lst.write_text("".join(rows), encoding="utf-8")
+        extension = "mkv" if indexed else "ts"
+        src = self.dir / "clips" / f"{clip['id']}.src.{extension}"
         parts = {s[0].stem.split("_")[0] for s in segs}
         mic = len(parts) == 1 and bool(speaker.declared_track(self.job.get("game_mic_track")))
         mapping = ["-map", "0:v:0", "-map", "0:a:0"] + (["-map", "0:a:1?"] if mic else [])
@@ -834,6 +868,9 @@ class Session:
                       "checks": self.checks, "skipped": self.skipped, "tokens": self.tokens, "words": len(self.words),
                       "rejected": self.rejected, "verdicts": list(reversed(self.verdicts)),
                       "every_min": int(self.settings.get("ai_every_min", 3)) or 3,
+                      "highlight_interval": max(config.LIVE_HIGHLIGHT_INTERVAL, int(self.settings["ai_every_min"] or 3) * 60)
+                                            if self._game() or speaker.protected(self.job, self.settings) else None,
+                      "highlight_budget": config.LIVE_HIGHLIGHT_REQUESTS,
                       "auto": None,
                       "pending_clips": len(self.manual)})
         jobs.save(self.job)
@@ -868,22 +905,14 @@ class Session:
                 sp, said = self.spike, self.said
                 if self.user_stopped:
                     pass
+                elif self._game() or speaker.protected(self.job, self.settings):
+                    self._highlight_step(draining=self.ended and not busy)
                 elif said and (self.t_done >= said["t"] + self.SAID_AFTER or (self.ended and not busy)):
                     self.said = None
                     self._ask_ai((said["t"] - self.SAID_BEFORE, said["t"] + self.SAID_AFTER), said["why"])
                 elif sp and (self.t_done >= sp["t"] + after or (self.ended and not busy)):
                     signal = "Jump: " + sp["why"]
-                    if speaker.protected(self.job, self.settings):
-                        peak = sp["t"]
-                        length = min(61, self.settings["max_len"])
-                        a = max(0, peak - min(36, length * 0.6))
-                        b = min(self.t_done, a + length)
-                        if b - a >= self.settings["min_len"] and a <= peak < b:
-                            if self._retain_highlight(a, b, peak, signal) is None:
-                                time.sleep(.25)
-                                continue
-                    else:
-                        self._ask_ai((sp["t"] - before, sp["t"] + after), signal)
+                    self._ask_ai((sp["t"] - before, sp["t"] + after), signal)
                     self.spike = None
                 elif self.t_done - self.last_check >= interval or (self.ended and not busy and self.t_done > self.last_check):
                     self._ask_ai()

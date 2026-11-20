@@ -1,5 +1,6 @@
 """Admission and retry policy shared by text and image requests."""
 import collections
+import contextvars
 import datetime as dt
 import hashlib
 import json
@@ -7,12 +8,24 @@ import random
 import re
 import threading
 import time
+from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
 from . import config
+
+_reservation = contextvars.ContextVar("ai_request_reservation", default=None)
+
+
+@contextmanager
+def request_budget(reserve):
+    token = _reservation.set(reserve)
+    try:
+        yield
+    finally:
+        _reservation.reset(token)
 
 
 class Deferred(RuntimeError):
@@ -134,6 +147,9 @@ class Limiter:
                     if (rpm and len(recent) >= rpm) or (tpm and sum(t for _, t in recent) + estimated > tpm):
                         raise Deferred("local_rate", recent[0][0] + 60)
                     if self.waiting[0] is ticket and not self.active:
+                        reserve = _reservation.get()
+                        if reserve is not None:
+                            reserve(now)
                         self.active = True
                         self.daily[scope] = (reset, count + 1)
                         recent.append((now, estimated))

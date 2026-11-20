@@ -38,3 +38,4 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - run: node tests/test_twitch_player.cjs
       - run: node tests/test_layout_editor.cjs
+      - run: node tests/test_highlight_dashboard.cjs

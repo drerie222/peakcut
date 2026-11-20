@@ -147,7 +147,7 @@ def job_dir(jid) -> Path:
     return Path(_jobs[jid]["dir"])
 
 
-HIDDEN = ("dir", "user", "source_path", "recover", "candidates", "recording_offsets", "recording_probe_part")
+HIDDEN = ("dir", "user", "source_path", "recover", "candidates", "recording_offsets", "recording_probe_part", "live_ai_requests")
 
 
 def public(job) -> dict:
@@ -156,7 +156,8 @@ def public(job) -> dict:
     out["source"] = {k: v for k, v in job["source"].items() if k != "path"}
     out["clips"] = [{k: v for k, v in c.items() if k not in ("src", "fixed_words", "fixed_for")} for c in job["clips"]]
     if job.get("candidates"):
-        out["candidates"] = [{k: entry[k] for k in ("id", "start", "end", "signal", "state", "reason", "due")
+        out["candidates"] = [{k: entry[k] for k in ("id", "start", "end", "signal", "state", "reason", "due", "created",
+                                                  "analysis", "wait_reason", "speech_state")
                               if k in entry} for entry in job["candidates"]]
     ai = job.get("ai") or {}
     out["ai"] = {"tokens": ai.get("tokens", 0), "note": ai.get("note", ""), "used": bool(ai.get("model"))}   # never the model, never raw errors
@@ -486,7 +487,12 @@ def render_one(job, clip, words, *, verified_mic=False):
             clip.pop("gameplay_mask", None)
         post = {k: clip[k] for k in ("title", "description", "hashtags", "hook", "start", "end", "score")}
         (d / "clips" / f"{clip['id']}.json").write_text(json.dumps(post, indent=1), encoding="utf-8")
-        if clip["version"] == 1:
+        if clip.get("require_quality") and clip["quality"]["issues"]:
+            clip.update(status="held", error=" ".join(clip["quality"]["issues"]))
+            creators.log(job["creator"], f"Clip held for quality review: {clip['error']}")
+        elif clip["version"] == 1 or (clip.get("require_quality") and not clip.get("ready_once")):
+            if clip.get("require_quality"):
+                clip["ready_once"] = True
             clip.setdefault("made_at", time.time())
             creators.log(job["creator"], f"Clip ready (score {clip['score']}): {clip['title'] or clip['hook']}")
             save(job)

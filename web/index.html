@@ -1729,6 +1729,7 @@ function postPills(c) {
 function clipHtml(j, c) {
   const m = `/media/${j.id}/`, a = `data-j="${j.id}" data-c="${esc(c.id)}"`;
   const body = c.status === "done" ? `<img src="${m}${esc(c.cover)}?v=${c.version}" alt="" loading="lazy"><span class="veil"><span>${ic("play")}</span></span>`
+    : c.status === "held" ? '<span class="making" style="animation:none">Held by quality checks. Open to review.</span>'
     : c.status === "error" ? `<span class="making" style="animation:none;color:var(--bad);background:var(--bad-soft)">Could not make this clip. Open it to try again.</span>`
     : `<span class="making">${c.status === "rendering" ? "Making this clip…" : "Waiting its turn…"}</span>`;
   const key = `c:${j.id}:${c.id}`, busyClip = c.status === "queued" || c.status === "rendering";
@@ -1757,8 +1758,45 @@ function everyPick(cid, v) {
     <button type="button" class="evbtn pick-btn" aria-haspopup="listbox" aria-expanded="false" aria-label="How often the AI checks"><span class="pv">${cur[1]}</span>${ic("caret").replace("<svg", '<svg class="car"')}</button>
     <div class="pick-menu" role="listbox">${EVERY.map(([k, l, h]) => `<button type="button" class="pick-opt" role="option" data-v="${k}" aria-selected="${k === cur[0]}"><span class="pl">${l}</span>${h ? `<small class="ph">${h}</small>` : ""}${ic("check").replace("<svg", '<svg class="tick"')}</button>`).join("")}</div></div>`;
 }
+const highlightStatus = {
+  not_called:"AI not called", analyzing:"AI request in progress", waiting:"Waiting to call AI",
+  api_failed:"API request failed", no_highlight:"No highlight found", verified:"Highlight verified",
+  image_failed:"AI not called · frame extraction failed"
+};
+const highlightWait = {
+  daily_quota:"Provider daily quota reached", local_daily_budget:"Daily request budget reached",
+  stream_hourly_budget:"Stream hourly request budget reached", stream_budget_disabled:"Stream AI budget is disabled",
+  provider_rate:"Provider rate limit", provider_tokens:"Provider token limit",
+  local_rate:"Local request limit", request_exceeds_token_budget:"Request exceeds the token budget",
+  transient:"Provider temporarily unavailable", queue_full:"AI queue full", queue_wait:"Waiting for the AI queue",
+  duplicate_in_flight:"This scene is already being checked", vision_deadline:"AI check timed out"
+};
+function highlightRows(moments) {
+  return moments.slice(0, 6).map(m => {
+    const note = highlightWait[m.wait_reason] || m.reason;
+    const due = m.wait_reason && m.state === "waiting" && m.due > Date.now() / 1000
+      ? " · try after " + new Date(m.due * 1000).toLocaleTimeString() : "";
+    const speech = {failed:"Transcription failed; visual review only", no_speech:"No speech detected",
+      disabled:"Transcription disabled", available:"Mixed speech used for analysis only"}[m.speech_state];
+    return `<div class="sub">${fmt(m.start)}–${fmt(m.end)} · ${esc(m.signal)} · ${esc(highlightStatus[m.analysis] || m.state)}
+      ${["accepted","rendered","held","failed","expired"].includes(m.state) && m.analysis ? ` · ${esc(m.state)}` : ""}
+      ${note ? ` · ${esc(note)}` : ""}${esc(due)}${speech ? ` · ${esc(speech)}` : ""}
+      ${m.state === "failed" ? ` <button class="btn sm" data-act="candidate-retry" data-j="${esc(m.job)}" data-c="${esc(m.id)}">Retry</button>` : ""}</div>`;
+  }).join("");
+}
+function highlightSummary(j) {
+  const p = j.pipeline || {};
+  return `${p.candidate_count ?? j.candidates?.length ?? 0} candidates · ${p.visual_checks || 0} completed AI reviews
+    · ${p.live_ai_requests || 0} API attempts · ${p.candidate_rejected || 0} rejected
+    ${p.highlight_failures ? ` · ${p.highlight_failures} failed reviews` : ""}
+    ${p.candidate_overload ? ` · ${p.candidate_overload} missed at capacity` : ""}
+    ${p.candidate_missing_media ? ` · ${p.candidate_missing_media} missing source footage` : ""}
+    <span class="sub">${p.highlight_frames_seconds || 0} s frames · ${p.highlight_speech_seconds || p.transcribe_seconds || 0} s speech
+    · ${p.highlight_ai_seconds || p.visual_seconds || 0} s AI · ${p.render_seconds || 0} s render · ${p.export_seconds || 0} s export</span>`;
+}
 function liveHtml(j) {
   const L = j.live || {elapsed:0, lines:[], level:[], chat:null, checks:0, buffer_sec:0, pending_clips:0};
+  const gaming = !!L.highlight_interval;
   return `<div class="livecard">
     <div class="lc-head"><div class="lc-title"><span class="pill live"><span class="dot"></span>Live</span>
         <h3>${esc(j.title || j.source.name)}</h3><p class="sub">${esc(j.uploader)}${j.uploader ? " · " : ""}${esc(j.stage)}</p></div>
@@ -1766,14 +1804,17 @@ function liveHtml(j) {
         <button class="btn" data-act="clipnow" data-j="${j.id}" data-s="60">Last 60s</button>
         <button class="btn danger" data-act="stoplive" data-j="${j.id}">${ic("stop")}Stop</button></div></div>
     <div class="stats"><div class="stat"><b>${fmt(L.elapsed)}</b><span>Recorded</span></div><div class="stat"><b>${Math.round(L.buffer_sec / 60)} min</b><span>Kept in buffer</span></div>
-      <div class="stat">${everyPick(j.creator, L.every_min ?? 3)}<span>${L.every_min === 0 ? (L.auto?.warming ? "AI checks: learning the stream" : L.auto?.waiting ? "AI checks: jump spotted, checking soon" : `AI checks on jumps · ${L.auto?.spikes || 0} so far`) : "AI checks every"}</span></div>
-      <div class="stat"><b>${L.checks}</b><span>AI calls${L.skipped ? ` · ${L.skipped} skipped` : ""}${L.rejected ? ` · ${L.rejected} turned down` : ""}</span></div><div class="stat"><b>${j.clips.length}</b><span>Clips so far</span></div>
+      <div class="stat">${everyPick(j.creator, L.every_min ?? 3)}<span>${gaming ? "Quiet review every " + fmt(L.highlight_interval) : "AI checks every"}</span></div>
+      <div class="stat"><b>${gaming ? j.pipeline?.visual_checks || 0 : L.checks}</b><span>${gaming ? "AI reviews" : "AI calls"}</span></div><div class="stat"><b>${j.clips.filter(c => c.status === "done").length}</b><span>Clips ready</span></div>
       ${L.pending_clips ? `<div class="stat"><b>${L.pending_clips}</b><span>Hand clip being prepared</span></div>` : ""}</div>
     <div class="meters">
       <div class="meter"><h4>Loudness, last minute</h4>${spark(L.level, "", -55, -8)}</div>
       ${L.chat ? `<div class="meter"><h4>Chat messages per second</h4>${spark(L.chat, "chat", 0, Math.max(4, ...L.chat))}</div>` : ""}
-      <div class="meter"><h4>Latest AI decisions</h4><div class="said" style="justify-content:flex-start;color:var(--text)">${(L.verdicts || []).length ? L.verdicts.slice(0, 4).map(v => `<div>${fmt(v.t)} · ${v.transcript != null ? "words " + v.transcript : ""}${v.reaction != null ? " · reaction " + v.reaction : ""} · <span class="sub">${esc(v.result)}</span></div>`).join("") : "<div class='sub'>First check soon…</div>"}</div></div>
-      <div class="meter"><h4>What was just said</h4><div class="said">${L.lines.length ? L.lines.map(t => `<div>${esc(t)}</div>`).join("") : "<div>Listening…</div>"}</div></div>
+      ${gaming ? `<div class="meter"><h4>Highlight review</h4><div>${highlightSummary(j)}</div>
+        <div class="sub">${L.highlight_budget} API attempts allowed per stream hour</div>
+        ${highlightRows([...(j.candidates || [])].reverse().map(m => ({...m, job:j.id}))) || "<div class='sub'>AI not called · collecting the first review window</div>"}</div>`
+      : `<div class="meter"><h4>Latest AI decisions</h4><div class="said" style="justify-content:flex-start;color:var(--text)">${(L.verdicts || []).length ? L.verdicts.slice(0, 4).map(v => `<div>${fmt(v.t)} · ${v.transcript != null ? "words " + v.transcript : ""}${v.reaction != null ? " · reaction " + v.reaction : ""} · <span class="sub">${esc(v.result)}</span></div>`).join("") : "<div class='sub'>First check soon…</div>"}</div></div>
+      <div class="meter"><h4>What was just said</h4><div class="said">${L.lines.length ? L.lines.map(t => `<div>${esc(t)}</div>`).join("") : "<div>Listening…</div>"}</div></div>`}
     </div>${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}</div>
     ${j.clips.length ? `<div class="grid" style="margin-bottom:28px">${[...j.clips].reverse().map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
 }
@@ -1792,6 +1833,8 @@ function jobHtml(j) {
     ${busy ? `<div class="bar"><i style="width:${Math.round(j.progress * 100)}%"></i></div><p class="sub">${esc(j.stage)} · ${Math.round(j.progress * 100)}%</p>` : ""}
     ${j.status === "done" && !j.clips.length ? `<p class="sub">${esc(j.stage)}</p>` : ""}
     ${j.error ? `<div class="err">${esc(j.error)}<button class="rep" data-act="report" data-ctx="${esc("Video failed: " + (j.title || j.source.name || "") + " | " + j.error)}">Report this</button></div>` : ""}${j.ai?.note ? `<p class="sub">${esc(j.ai.note)}</p>` : ""}
+    ${j.candidates?.length ? `<details><summary>Highlight review · ${j.pipeline?.candidate_count ?? j.candidates.length} candidates</summary>
+      <p class="sub">${highlightSummary(j)}</p>${highlightRows([...j.candidates].reverse().map(m => ({...m, job:j.id})))}</details>` : ""}
     ${j.clips.length ? `<div class="grid">${j.clips.map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
 }
 /* ---- selecting several videos and clips: delete or download them together */
@@ -1867,7 +1910,10 @@ function drawJobs() {
 /* ============================================================ creator pages */
 function costHint(every) {
   every = Number(every) || 3;
-  return `About ${Math.round(60 / every * 2)} AI calls per live hour at most. Each check covers everything since the last one, so slower checks don't miss moments; they find them later.`;
+  const h = S.status.live_highlights;
+  return h
+    ? `Gaming reviews sample a quiet window every ${fmt(Math.max(every * 60, h.interval_sec))} and also check jumps. Limit: ${h.requests_per_hour} API attempts per stream hour.`
+    : "This sets the interval between regularly scheduled checks.";
 }
 function channelRows(c) {
   const chs = c.channels || {}, many = Object.keys(chs).length > 1;
@@ -2215,7 +2261,7 @@ function drawClipDlg(full) {
   const j = jobOf(D.jid), c = j?.clips.find(x => x.id === D.cid), dlg = $("#clipdlg");
   if (!c) { if (dlg.open) dlg.close(); return; }
   const m = `/media/${j.id}/`, sig = c.status + c.version;
-  const stage = c.status === "done" ? `<video src="${m}${esc(c.file)}?v=${c.version}" poster="${m}${esc(c.cover)}?v=${c.version}" controls autoplay playsinline></video>`
+  const stage = ["done", "held"].includes(c.status) ? `<video src="${m}${esc(c.file)}?v=${c.version}" poster="${m}${esc(c.cover)}?v=${c.version}" controls ${c.status === "done" ? "autoplay" : ""} playsinline></video>`
     : c.status === "error" ? `<div class="err" style="padding:20px;text-align:center">${esc(c.error || "Could not make this clip.")}</div>`
     : `<span class="making">${c.status === "rendering" ? "Making this clip…" : "Waiting its turn…"}</span>`;
   if (full) {
@@ -2248,7 +2294,7 @@ function drawClipDlg(full) {
       </div></div>`;
   } else if (D.sig !== sig) $("#stage").innerHTML = stage;
   D.sig = sig;
-  put($("#clip-quality"), c.status !== "done" ? "" : [
+  put($("#clip-quality"), !["done", "held"].includes(c.status) ? "" : [
     c.quality?.issues?.length ? `<p class="err">Draft held. ${esc(c.quality.issues.join(" "))}</p>` : "",
     c.speech_source === "mixed" ? '<p class="help">Captions withheld because the speaker cannot be verified from the available audio.</p>' : "",
     c.speech_source === "mic_unavailable" ? '<p class="help">Captions withheld because the isolated microphone track could not be read.</p>' : "",
@@ -2295,9 +2341,9 @@ function drawWatchlist() {
       const held = clips.filter(k => k.watch_export?.state === "held").length;
       const decision = c.auto_watch ? S.watchDecisions?.[c.id] : null;
       const record = js.find(j => j.id === c.live_job) || js[0];
-      const recording = record?.recording_quality, phases = record?.pipeline || {};
+      const recording = record?.recording_quality;
       const moments = js.flatMap(j => (j.candidates || []).map(m => ({...m, job:j.id})));
-      const recent = moments.slice(0, 6);
+      const recent = [...moments].sort((a, b) => b.created - a.created);
       return `<tr><td class="c-main" data-l="Streamer"><button class="lnk" data-act="go" data-v="c:${esc(c.id)}">${esc(c.name)}</button>
         <span class="sub">Priority ${esc(c.watchlist.priority)}</span></td>
         <td data-l="Stream"><span>${esc(active)} · ${esc(s.platform || Object.keys(c.channels)[0] || "No channel")}</span>
@@ -2310,11 +2356,9 @@ function drawWatchlist() {
           </details>` : ""}` : ""}</td>
         <td data-l="Highlights and clips"><span>${clips.filter(k => k.score > 0).length} highlights · ${done} ready · ${processing} processing</span>
         ${drafts || exports || sent || held ? `<span class="sub">${drafts} Buffer drafts · ${exports} waiting · ${held} held · ${sent} sent</span>` : ""}
-        ${record ? `<span class="sub">${phases.visual_checks || 0} visual checks · ${phases.transcribe_seconds || 0} s speech · ${phases.visual_seconds || 0} s review · ${phases.render_seconds || 0} s render · ${phases.export_seconds || 0} s export</span>
-          ${phases.candidate_overload || phases.candidate_missing_media ? `<span class="sub">${phases.candidate_overload || 0} missed at capacity · ${phases.candidate_missing_media || 0} missing source footage</span>` : ""}` : ""}
+        ${record ? `<span class="sub">${highlightSummary(record)}</span>` : ""}
         ${recent.length ? `<details><summary>${moments.filter(m => m.state === "waiting").length} waiting · ${moments.filter(m => ["accepted","rendered"].includes(m.state)).length} accepted · ${moments.filter(m => m.state === "rejected").length} rejected</summary>
-          ${recent.map(m => `<div class="sub">${fmt(m.start)}–${fmt(m.end)} · ${esc(m.state)} · ${esc(m.signal)}
-          ${m.reason ? `<span>${esc(m.reason)}</span>` : ""}${m.state === "failed" ? ` <button class="btn sm" data-act="candidate-retry" data-j="${esc(m.job)}" data-c="${esc(m.id)}">Retry</button>` : ""}</div>`).join("")}
+          ${highlightRows(recent)}
           </details>` : ""}
         ${lastError ? `<span class="err">${esc(lastError)}</span>` : ""}</td>
         <td class="c-act"><div class="row"><button class="btn sm" data-act="watch-toggle" data-c="${esc(c.id)}"
