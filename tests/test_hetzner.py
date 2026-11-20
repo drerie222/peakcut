@@ -187,9 +187,11 @@ def test_retention_and_integrations():
     (folder / "clips").mkdir()
     raw, video, cover = (folder / "clips" / name for name in ("clip001.src.ts", "clip001.mp4", "clip001.jpg"))
     clip = {"id": "clip001", "status": "done", "file": video.name, "version": 1, "src": str(raw), "title": "Fixture"}
-    job.update(status="done", clips=[clip])
+    indexed = folder / "clips" / "moment-fixture.src.mkv"
+    indexed_clip = {"id": "moment-fixture", "src": str(indexed), "status": "held"}
+    job.update(status="done", clips=[clip, indexed_clip])
     old_segment, recent_segment, unrelated = (chunks / name for name in ("p01_000001.ts", "p01_000002.ts", "keep.ts"))
-    for path in (raw, video, cover, old_segment, recent_segment, unrelated):
+    for path in (raw, indexed, video, cover, old_segment, recent_segment, unrelated):
         path.write_bytes(b"fixture")
         if path != recent_segment:
             os.utime(path, (now-3600000, now-3600000))
@@ -216,7 +218,8 @@ def test_retention_and_integrations():
         check("the retention sweep skips live jobs with pending renders", storage.prune_recordings(now) == 0 and raw.exists())
         clip["status"] = "done"
         check("expiry removes only old generated media and records loss of the editable raw clip",
-              storage.prune_recordings(now) == 2 and not raw.exists() and not old_segment.exists()
+              storage.prune_recordings(now) == 3 and not raw.exists() and not old_segment.exists()
+              and not indexed.exists() and indexed_clip.get("raw_expired")
               and recent_segment.exists() and unrelated.exists() and clip.get("raw_expired"))
         check("finished clips and active Buffer download tokens survive raw-file expiry",
               video.exists() and cover.exists() and buffer.video_file(token) == video)

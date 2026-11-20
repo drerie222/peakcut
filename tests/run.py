@@ -62,6 +62,7 @@ def main() -> int:
                 ("gaming watchlist and draft workflow", ["tests/test_watchlist.py"]),
                 ("gaming clip quality and speaker attribution", ["tests/test_clip_quality.py"]),
                 ("full gameplay TikTok layout and rendering", ["tests/test_full_gameplay.py"]),
+                ("entertainment highlights without relying on loudness or chat", ["tests/test_entertainment.py"]),
                 ("24x7 quotas, capture and recovery", ["tests/test_24x7.py"]),
                 ("Hetzner scheduling, resource limits, retention and drafts", ["tests/test_hetzner.py"]),
                 ("the new-version notice", ["tests/test_updates.py"]),

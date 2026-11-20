@@ -131,7 +131,8 @@ def gameplay_issue(path, clip, offset):
         return "Only a sound spike was detected. This highlight needs visual confirmation."
     if clip.get("score", 0) and clip.get("score", 0) < clip.get("quality_min_score", 65):
         return "The highlight score is below the review threshold."
-    if (clip.get("score", 0) and clip.get("evidence") not in ("visual", "isolated_mic")
+    reviewed = clip.get("require_quality") and clip.get("evidence") == "multimodal"
+    if (clip.get("score", 0) and not reviewed and clip.get("evidence") not in ("visual", "isolated_mic")
             and clip.get("speech_source") != "isolated_mic"):
         return "The highlight needs visual confirmation or verified streamer speech."
     span = clip["end"] - clip["start"]

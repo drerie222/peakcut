@@ -74,6 +74,8 @@ The default **Full Gameplay / TikTok** layout fits the complete game into the 10
 separate positions for the hook and captions, and an optional facecam above the game. The earlier blurred
 **Gameplay + facecam** layout remains available. [Layout and rendered comparison](docs/FULL_GAMEPLAY_TIKTOK.md)
 
+The live reviewer also checks selected quiet moments on a schedule. See [live highlight settings and verification](docs/LIVE_HIGHLIGHTS.md) for budgets, speech handling, and dashboard outcomes.
+
 To do that, PeakCut has to know where the webcam is. `studio/facecam.py` finds it
 by the one thing a webcam always has and a game almost never has: **a straight
 border that stays in the same place in every frame**. A wall in the game moves, a

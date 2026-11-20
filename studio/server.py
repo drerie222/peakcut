@@ -585,6 +585,7 @@ def status(request: Request):
     return {"user": auth.public(me_), "update": updates.latest() if me_.is_admin else None, "accounts": config.ACCOUNTS, "disk_full": load.disk_full(), "no_ffmpeg": bool(_tools.missing()), "links": {"repo": config.REPO_URL, "follow": config.FOLLOW_URL}, "ai": usage.brief(), "unread": notices.unread(),
             "tour": not accounts.settings()["tour_done"], "buffer_drafts": bool(me_.is_admin and buffer.configured()),
             "draft_only": config.DRAFT_ONLY,
+            "live_highlights": {"interval_sec": config.LIVE_HIGHLIGHT_INTERVAL, "requests_per_hour": config.LIVE_HIGHLIGHT_REQUESTS},
             "watchlist": {"limit": watchlist.recording_limit(), "ceiling": min(30, config.MAX_LIVE_TOTAL, config.MAX_LIVE_PER_USER),
                           "buffer": bool(me_.is_admin and accounts.settings()["watch_buffer"])},
             "youtube": accounts.youtube_ready(), "connect": {p: accounts.can_connect(p) for p in accounts.PLATFORM_NAMES}, "max_upload_mb": config.MAX_UPLOAD_MB, "upload_part_mb": config.UPLOAD_PART_MB, "max_batch": config.MAX_ACTIVE_JOBS_PER_USER,

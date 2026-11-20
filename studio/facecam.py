@@ -318,9 +318,12 @@ def _finish(path: str | Path, found: dict, w: int, h: int, still: np.ndarray) ->
 def _frame_jpeg(path: str | Path, width: int = 768, at=None) -> bytes:
     """One frame of the stream, small, as a JPEG: what a model is shown."""
     try:
+        seek = ["-ss", f"{max(0.0, _duration(path) / 2.0 if at is None else at):.1f}"]
+        # A short MPEG-TS piece may have one GOP. Input seeking can jump past it and return no frame.
+        accurate = at is not None and Path(path).suffix.lower() == ".ts"
         return subprocess.run(
-            ["ffmpeg", "-v", "error", "-ss", f"{max(0.0, _duration(path) / 2.0 if at is None else at):.1f}",
-             *load.ffmpeg_threads(), "-i", str(path), "-filter_threads", "1", "-threads", "1",
+            ["ffmpeg", "-v", "error", *([] if accurate else seek), *load.ffmpeg_threads(), "-i", str(path),
+             *(seek if accurate else []), "-filter_threads", "1", "-threads", "1",
              "-frames:v", "1", "-vf", f"scale={width}:-2", "-pix_fmt", "yuvj420p", "-q:v", "4",
              "-f", "image2pipe", "-vcodec", "mjpeg", "-"],
             capture_output=True, timeout=120 if at is None else 10).stdout or b""
@@ -328,21 +331,25 @@ def _frame_jpeg(path: str | Path, width: int = 768, at=None) -> bytes:
         return b""
 
 
-def frame_strip(segments, times):
+def frame_strip(segments, times, *, with_times=False):
     """Combine a few frames from the rolling buffer for a single visual check."""
     from PIL import Image
 
-    frames = []
+    frames, captured = [], []
     for t in sorted({round(t, 1) for t in times}):
         part = next(((path, start) for path, start, end in segments if start <= t < end), None)
         if not part:
             continue
         raw = _frame_jpeg(part[0], width=480, at=t - part[1])
         if raw:
-            with Image.open(BytesIO(raw)) as im:
-                frames.append(im.convert("RGB"))
+            try:
+                with Image.open(BytesIO(raw)) as im:
+                    frames.append(im.convert("RGB"))
+            except OSError:
+                continue
+            captured.append(t)
     if len(frames) < 2:
-        return b""
+        return (b"", []) if with_times else b""
     sheet = Image.new("RGB", (480, sum(im.height for im in frames)))
     offset = 0
     for im in frames:
@@ -350,7 +357,7 @@ def frame_strip(segments, times):
         offset += im.height
     result = BytesIO()
     sheet.save(result, format="JPEG", quality=80)
-    return result.getvalue()
+    return (result.getvalue(), captured) if with_times else result.getvalue()
 
 
 def _asked(path: str | Path, ask):

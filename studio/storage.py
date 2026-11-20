@@ -188,7 +188,10 @@ def prune_recordings(now=None):
             for clip in job["clips"]:
                 if not re.fullmatch(r"[\w-]+", clip["id"]):
                     continue
-                path = folder / "clips" / f"{clip['id']}.src.ts"
+                name = Path(clip.get("src") or "").name
+                if name not in {f"{clip['id']}.src.ts", f"{clip['id']}.src.mkv"}:
+                    continue
+                path = folder / "clips" / name
                 if clip.get("src") == str(path) and expire(path, folder / "clips"):
                     clip["raw_expired"] = changed = True
                     removed += 1
